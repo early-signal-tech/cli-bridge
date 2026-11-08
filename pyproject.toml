@@ -1,0 +1,21 @@
+[project]
+name = "cli-bridge"
+version = "0.1.0"
+description = "Engines for Duck Harness devices that wrap a command-line tool"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+# ES-1's engine: flowctl over the app protocol (JSON Lines on stdin/stdout).
+es1-serve = "cli_bridge.tools.flowctl:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cli_bridge"]
+
+[dependency-groups]
+dev = ["pytest>=9.1.1"]

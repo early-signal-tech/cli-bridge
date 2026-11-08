@@ -1,0 +1,73 @@
+{
+  "device": "es1",
+  "tool": "flowctl",
+  "binary": "flowctl",
+  "binary_env": "ES1_FLOWCTL",
+  "fallback_paths": ["/usr/local/bin/flowctl"],
+  "version_argv": ["--version"],
+  "version_pattern": "(\\d+\\.\\d+\\.\\d+)",
+  "tested_versions": ["0.6.13"],
+  "profile_flag": "--profile",
+  "profile_type": "profile",
+  "max_rows": 20000,
+  "stderr_noise": "WARN flowctl",
+  "error_codes": [
+    {"contains": "valid authentication credentials", "code": "not_logged_in"},
+    {"contains": "Failed to authenticate", "code": "not_logged_in"},
+    {"contains": "is not known", "code": "not_a_task"},
+    {"contains": "no live spec found", "code": "not_found"}
+  ],
+  "types": {
+    "profile": "[A-Za-z0-9_][A-Za-z0-9_-]*",
+    "catalog_name": "(?!.*\\.\\.)[^\\W][\\w.-]*(/[\\w.-]+)+",
+    "catalog_prefix": "(?!.*\\.\\.)[^\\W][\\w.-]*(/[\\w.-]+)*/",
+    "duration": "(\\d+(s|m|h|d))+"
+  },
+  "verbs": {
+    "catalog_list": {
+      "argv": ["catalog", "list", "--flows", "-o", "json"],
+      "mode": "once",
+      "args": {
+        "prefix": {"type": "catalog_prefix", "flag": "--prefix"}
+      }
+    },
+    "catalog_status": {
+      "argv": ["catalog", "status", "-o", "json"],
+      "mode": "once",
+      "args": {
+        "names": {"type": "catalog_name", "many": true, "required": true}
+      }
+    },
+    "catalog_history": {
+      "argv": ["catalog", "history", "-o", "json"],
+      "mode": "once",
+      "args": {
+        "name": {"type": "catalog_name", "flag": "--name", "required": true}
+      }
+    },
+    "raw_stats": {
+      "argv": ["raw", "stats", "-o", "json"],
+      "mode": "once",
+      "args": {
+        "task": {"type": "catalog_name", "flag": "--task", "required": true},
+        "since": {"type": "duration", "flag": "--since", "default": "24h"}
+      }
+    },
+    "raw_list_shards": {
+      "argv": ["raw", "list-shards", "-o", "json"],
+      "mode": "once",
+      "args": {
+        "task": {"type": "catalog_name", "flag": "--task", "required": true}
+      }
+    },
+    "logs_follow": {
+      "argv": ["logs", "--follow", "-o", "json"],
+      "mode": "stream",
+      "snapshot": false,
+      "args": {
+        "task": {"type": "catalog_name", "flag": "--task", "required": true},
+        "since": {"type": "duration", "flag": "--since", "default": "1h"}
+      }
+    }
+  }
+}
