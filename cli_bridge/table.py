@@ -30,12 +30,24 @@ class Arg:
 
 
 @dataclass(frozen=True)
+class SnapshotRule:
+    """What a verb's snapshot may hold. Only what's named here is saved, so a field the tool
+    adds later stays out until someone adds it. `raw` saves stdout as it came, for output
+    that can't carry secrets or customer data."""
+
+    raw: bool = False
+    keep: tuple[str, ...] = ()  # dotted paths, copied whole
+    first_line: tuple[str, ...] = ()  # text: its first line, cut short
+    numbers: tuple[str, ...] = ()  # objects: only their numeric values
+
+
+@dataclass(frozen=True)
 class Verb:
     name: str
     argv: tuple[str, ...]
     mode: str
     args: tuple[Arg, ...]
-    snapshot: bool
+    snapshot: SnapshotRule | None  # None: never saved
     timeout: float
 
     def describe(self) -> dict:
@@ -89,6 +101,26 @@ class Table:
         return "tool_error"
 
 
+def _load_snapshot_rule(verb: str, spec: dict) -> SnapshotRule | None:
+    """Every verb has to say what it saves: leaving it out is an error, not a raw snapshot."""
+    if "snapshot" not in spec:
+        raise ValueError(f"verb {verb}: needs a snapshot rule, or \"snapshot\": false")
+    rule = spec["snapshot"]
+    if rule is False:
+        return None
+    if not isinstance(rule, dict) or set(rule) - {"raw", "keep", "first_line", "numbers"}:
+        raise ValueError(f"verb {verb}: a snapshot rule is false, or an object of raw, keep, first_line, numbers")
+    if rule.get("raw") is True:
+        if len(rule) > 1 or spec["mode"] == "stream":
+            raise ValueError(f"verb {verb}: raw stands alone, and a stream can't be saved raw")
+        return SnapshotRule(raw=True)
+    parsed = SnapshotRule(keep=tuple(rule.get("keep", ())), first_line=tuple(rule.get("first_line", ())),
+                          numbers=tuple(rule.get("numbers", ())))
+    if not (parsed.keep or parsed.first_line or parsed.numbers):
+        raise ValueError(f"verb {verb}: a snapshot rule has to keep something")
+    return parsed
+
+
 def load_table(path: str | Path) -> Table:
     raw = json.loads(Path(path).read_text())
     types = {name: re.compile(pattern) for name, pattern in raw.get("types", {}).items()}
@@ -105,7 +137,7 @@ def load_table(path: str | Path) -> Table:
                 raise ValueError(f"verb {name}: default for {arg_name} doesn't match its type")
             args.append(Arg(arg_name, a["type"], types[a["type"]], a.get("flag"), a.get("many", False),
                             a.get("required", False), default))
-        verbs[name] = Verb(name, tuple(spec["argv"]), spec["mode"], tuple(args), spec.get("snapshot", True),
+        verbs[name] = Verb(name, tuple(spec["argv"]), spec["mode"], tuple(args), _load_snapshot_rule(name, spec),
                            float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS)))
     profile_type = raw.get("profile_type")
     noise = raw.get("stderr_noise")

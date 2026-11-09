@@ -10,8 +10,9 @@ import time
 
 import pytest
 
+from cli_bridge.run import MAX_SNAPSHOT_TEXT, trim_row
 from cli_bridge.serve import Server, tool_report
-from cli_bridge.table import BadRequest, build_argv, load_table
+from cli_bridge.table import BadRequest, SnapshotRule, build_argv, load_table
 from cli_bridge.tools import flowctl
 
 FAKE_TOOL = r"""#!/usr/bin/env python3
@@ -34,6 +35,11 @@ elif cmd == "empty":
 elif cmd == "denied":
     sys.stderr.write("\x1b[33m WARN fake: please update\x1b[0m\n\x1b[31mtrace noise\x1b[0m\n")
     sys.stderr.write("Error: fetching\n\nCaused by:\n    no valid login here\n"); sys.exit(1)
+elif cmd == "sensitive":
+    print(open(os.environ["FAKE_LINES"]).read(), end="", flush=True)
+    if "--follow" in args:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        time.sleep(30)
 elif cmd == "slow":
     time.sleep(30)
 elif cmd == "follow":
@@ -42,6 +48,23 @@ elif cmd == "follow":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     time.sleep(30)
 """
+
+RULE = {"keep": ["ts", "level", "shard.name"], "first_line": ["message"], "numbers": ["fields"]}
+MARKER = "CUSTOMER-MARKER"
+
+# A real failure's shape (estuary/flow's TestExtractorValidation snapshot), with the document in
+# the error as an object and as text, plus what else mustn't get saved.
+SENSITIVE_LINES = [
+    json.dumps({"ts": "t1", "level": "error", "shard": {"name": "acme/a", "labels": MARKER},
+                "message": "document failed validation",
+                "fields": {"round": 3, "ok": True, "error": ["failed", {
+                    "basic_output": [{"instanceValue": MARKER}], "document": {"email": MARKER}}]}}),
+    json.dumps({"ts": "t2", "level": "error", "message": "failed\n\nCaused by:\n    {\"document\": \"" + MARKER + "\"}"}),
+    json.dumps({"ts": "t3", "level": "info", "message": "x" * 500, "fields": {"value": MARKER, "nested": {"n": 1}}}),
+    f"plain text with {MARKER}",
+    json.dumps([MARKER]),
+    json.dumps({"other": MARKER}),
+]
 
 TABLE = {
     "device": "fake1",
@@ -58,12 +81,18 @@ TABLE = {
     "error_codes": [{"contains": "no valid login", "code": "not_logged_in"}],
     "types": {"word": "[a-z0-9_/]+"},
     "verbs": {
-        "rows": {"argv": ["rows"], "mode": "once", "args": {"name": {"type": "word", "flag": "--name"}}},
-        "many": {"argv": ["many"], "mode": "once"},
-        "empty": {"argv": ["empty"], "mode": "once"},
-        "denied": {"argv": ["denied"], "mode": "once"},
-        "slow": {"argv": ["slow"], "mode": "once"},
-        "short": {"argv": ["slow"], "mode": "once", "timeout": 0.2},
+        "rows": {"argv": ["rows"], "mode": "once", "snapshot": {"raw": True},
+                 "args": {"name": {"type": "word", "flag": "--name"}}},
+        "many": {"argv": ["many"], "mode": "once", "snapshot": {"raw": True}},
+        "empty": {"argv": ["empty"], "mode": "once", "snapshot": {"raw": True}},
+        "denied": {"argv": ["denied"], "mode": "once", "snapshot": {"raw": True}},
+        "slow": {"argv": ["slow"], "mode": "once", "snapshot": {"raw": True}},
+        "short": {"argv": ["slow"], "mode": "once", "snapshot": {"raw": True}, "timeout": 0.2},
+        "trimmed": {"argv": ["sensitive"], "mode": "once", "snapshot": RULE},
+        "trimmed_empty": {"argv": ["empty"], "mode": "once", "snapshot": RULE},
+        "trimmed_many": {"argv": ["many"], "mode": "once", "snapshot": {"keep": ["n"]}},
+        "trimmed_follow": {"argv": ["sensitive", "--follow"], "mode": "stream", "snapshot": RULE},
+        "quiet_follow": {"argv": ["empty"], "mode": "stream", "snapshot": RULE},
         "private": {"argv": ["rows"], "mode": "once", "snapshot": False},
         "follow": {"argv": ["follow"], "mode": "stream", "snapshot": False},
         "follow_ends": {"argv": ["follow", "--then-exit"], "mode": "stream", "snapshot": False},
@@ -123,6 +152,9 @@ def env(tmp_path, monkeypatch):
     calls = tmp_path / "calls.jsonl"
     monkeypatch.setenv("FAKE_TOOL_PATH", str(tool))
     monkeypatch.setenv("FAKE_CALLS", str(calls))
+    lines = tmp_path / "lines.jsonl"
+    lines.write_text("\n".join(SENSITIVE_LINES) + "\n")
+    monkeypatch.setenv("FAKE_LINES", str(lines))
     path = tmp_path / "table.json"
     path.write_text(json.dumps(TABLE))
     return {"table": load_table(path), "snapshots": tmp_path / "Snapshots", "calls": calls, "tool": tool}
@@ -301,6 +333,108 @@ def test_a_running_id_cant_be_reused(client):
 # stream
 
 
+EXPECTED_TRIMMED = [
+    {"ts": "t1", "level": "error", "shard": {"name": "acme/a"}, "message": "document failed validation",
+     "fields": {"round": 3}},
+    {"ts": "t2", "level": "error", "message": "failed"},
+    {"ts": "t3", "level": "info", "message": "x" * MAX_SNAPSHOT_TEXT},
+]
+
+
+def saved_text(env):
+    return "".join(p.read_text() for p in env["snapshots"].rglob("*.jsonl"))
+
+
+def test_a_trimmed_snapshot_holds_only_what_the_rule_names(env, client):
+    r = client.result(id="r", type="trimmed")
+    assert [json.loads(line) for line in open(r["snapshot"])] == EXPECTED_TRIMMED
+    assert MARKER not in saved_text(env)
+    assert stat.S_IMODE(os.stat(r["snapshot"]).st_mode) == 0o600
+
+
+def test_the_face_still_gets_every_row_whole(client):
+    r = client.result(id="r", type="trimmed")
+    assert r["rows"][0]["fields"]["value"] == MARKER and r["rows"][-1] == {"other": MARKER}
+    assert r["count"] == 5 and r["bad_lines"] == 1
+
+
+def test_a_trimmed_snapshot_has_every_row_even_past_the_faces_limit(client):
+    r = client.result(id="r", type="trimmed_many")
+    assert r["truncated"] and [json.loads(line)["n"] for line in open(r["snapshot"])] == [0, 1, 2, 3, 4]
+
+
+def test_a_trimmed_empty_result_is_an_empty_file(client):
+    assert os.path.getsize(client.result(id="r", type="trimmed_empty")["snapshot"]) == 0
+
+
+def test_a_stream_saves_trimmed_lines_and_sends_them_whole(env, client):
+    client.send(id="r", type="trimmed_follow")
+    events = [client.until("r", "event") for _ in SENSITIVE_LINES]
+    assert events[0]["line"]["fields"]["error"][1]["document"] == {"email": MARKER}
+    assert events[3]["text"] == SENSITIVE_LINES[3]
+    client.send(id="s", type="stop", request="r")
+    r = client.until("r", "result")["result"]
+    assert r["stopped"] and r["lines"] == len(SENSITIVE_LINES)
+    assert [json.loads(line) for line in open(r["snapshot"])] == EXPECTED_TRIMMED
+    assert MARKER not in saved_text(env)
+
+
+def test_a_stream_that_sent_nothing_leaves_no_file(env, client):
+    r = client.result(id="r", type="quiet_follow")
+    assert r["ok"] and r["snapshot"] is None
+    assert list(env["snapshots"].rglob("*.jsonl")) == []
+
+
+def test_a_snapshot_that_cant_be_saved_doesnt_cost_the_result(env, client):
+    env["snapshots"].write_text("a file where the folder should be")
+    r = client.result(id="r", type="trimmed")
+    assert r["ok"] and r["count"] == 5 and r["snapshot"] is None and r["snapshot_error"]
+    client.send(id="f", type="trimmed_follow")
+    client.until("f", "event")
+    client.send(id="s", type="stop", request="f")
+    r = client.until("f", "result")["result"]
+    assert r["ok"] and r["snapshot"] is None and r["snapshot_error"]
+
+
+@pytest.mark.parametrize("row,rule,expected", [
+    ("text", SnapshotRule(keep=("a",)), None),
+    ([1], SnapshotRule(keep=("a",)), None),
+    ({"b": 1}, SnapshotRule(keep=("a",)), None),
+    ({"a": {"b": 1, "c": 2}}, SnapshotRule(keep=("a.b",)), {"a": {"b": 1}}),
+    ({"a": None}, SnapshotRule(keep=("a.b",)), None),
+    ({"a": 5}, SnapshotRule(first_line=("a",)), None),
+    ({"a": ""}, SnapshotRule(first_line=("a",)), {"a": ""}),
+    ({"a": "one\ntwo"}, SnapshotRule(first_line=("a",)), {"a": "one"}),
+    ({"a": {"n": 1, "f": 1.5, "t": True, "s": "x", "o": {"n": 1}}}, SnapshotRule(numbers=("a",)), {"a": {"n": 1, "f": 1.5}}),
+    ({"a": {"s": "x"}}, SnapshotRule(numbers=("a",)), None),
+])
+def test_trim_row(row, rule, expected):
+    assert trim_row(row, rule) == expected
+
+
+@pytest.mark.parametrize("snapshot,mode", [
+    (True, "once"),
+    ("raw", "once"),
+    ({}, "once"),
+    ({"keep": []}, "once"),
+    ({"everything": True}, "once"),
+    ({"raw": True, "keep": ["a"]}, "once"),
+    ({"raw": True}, "stream"),
+])
+def test_a_table_cant_load_with_a_bad_snapshot_rule(tmp_path, snapshot, mode):
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({**TABLE, "verbs": {"v": {"argv": ["v"], "mode": mode, "snapshot": snapshot}}}))
+    with pytest.raises(ValueError, match="verb v"):
+        load_table(path)
+
+
+def test_a_table_cant_load_with_a_verb_that_doesnt_say_what_it_saves(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({**TABLE, "verbs": {"v": {"argv": ["v"], "mode": "once"}}}))
+    with pytest.raises(ValueError, match="needs a snapshot rule"):
+        load_table(path)
+
+
 def test_stream_sends_lines_until_stopped(env, client):
     client.send(id="r", type="follow")
     client.until("r", "accepted")
@@ -368,7 +502,7 @@ def test_flowctl_table_is_read_only_for_now():
     """This PR's scope. Login, drafts and publish arrive in their own PRs and change this test on purpose."""
     t = flowctl.table()
     assert set(t.verbs) == {"catalog_list", "catalog_status", "catalog_history", "raw_stats", "raw_list_shards",
-                            "logs_follow"}
+                            "logs_read", "logs_follow"}
     words = {word for verb in t.verbs.values() for word in verb.argv}
     words |= {a.flag for verb in t.verbs.values() for a in verb.args}
     for banned in ("publish", "delete", "draft", "auth", "discover", "preview", "update", "rpc", "--models",
@@ -376,8 +510,58 @@ def test_flowctl_table_is_read_only_for_now():
         assert banned not in words
 
 
-def test_flowctl_log_follows_are_not_snapshotted():
-    assert flowctl.table().verbs["logs_follow"].snapshot is False
+def test_flowctl_only_saves_stats_raw():
+    assert [name for name, verb in flowctl.table().verbs.items() if verb.snapshot.raw] == ["raw_stats"]
+
+
+def test_flowctl_logs_never_save_a_failing_document():
+    # estuary/flow's real validation failure, as a log line.
+    line = {
+        "_meta": {"uuid": "u1"}, "ts": "t", "level": "error", "shard": {"name": "acme/a", "kind": "capture", "build": "b"},
+        "message": f"source document failed validation\n\nCaused by:\n    {{\"document\": {{\"email\": \"{MARKER}\"}}}}",
+        "fields": {"round": 2, "error": ["failed", {"basic_output": [{"instanceValue": MARKER}], "document": {"e": MARKER}}]},
+    }
+    verbs = flowctl.table().verbs
+    assert verbs["logs_follow"].snapshot == verbs["logs_read"].snapshot
+    assert trim_row(line, verbs["logs_read"].snapshot) == {
+        "_meta": {"uuid": "u1"}, "ts": "t", "level": "error", "shard": {"name": "acme/a", "kind": "capture"},
+        "message": "source document failed validation", "fields": {"round": 2},
+    }
+
+
+def test_flowctl_catalog_list_drops_who_published_and_the_spec():
+    row = {
+        "catalogName": "acme/a", "userCapability": "admin",
+        "lastPublication": {"userEmail": MARKER, "userFullName": MARKER},
+        "liveSpec": {"catalogType": "capture", "isDisabled": False, "updatedAt": "t", "dataPlaneId": MARKER,
+                     "model": {"endpoint": {"connector": {"config": {"address": MARKER, "password_sops": MARKER}}}},
+                     "readsFrom": None, "writesTo": {"edges": [{"node": {"catalogName": "acme/a/t"}}]}},
+        "status": {"type": "OK", "summary": f"Fine\n{MARKER}"},
+    }
+    trimmed = trim_row(row, flowctl.table().verbs["catalog_list"].snapshot)
+    assert MARKER not in json.dumps(trimmed)
+    assert trimmed["liveSpec"]["writesTo"] == row["liveSpec"]["writesTo"] and trimmed["status"]["summary"] == "Fine"
+    assert set(trimmed) == {"catalogName", "liveSpec", "status"}
+
+
+def test_flowctl_history_and_status_drop_people_and_failure_text():
+    verbs = flowctl.table().verbs
+    history = {"catalog_name": "acme/a", "catalog_type": "capture", "publication": {
+        "publicationId": "p", "publishedAt": "t", "detail": MARKER, "userEmail": MARKER, "userFullName": MARKER,
+        "userAvatarUrl": MARKER, "userId": MARKER, "model": MARKER}}
+    status = {"catalogName": "acme/a", "catalogType": "capture", "status": {"type": "OK", "summary": "ok", "controller": {
+        "failures": 1, "error": MARKER,
+        "activation": {"recentFailureCount": 1, "lastFailure": {"text": MARKER}},
+        "publications": {"history": [{"detail": MARKER}]}}}}
+    assert MARKER not in json.dumps(trim_row(history, verbs["catalog_history"].snapshot))
+    trimmed = trim_row(status, verbs["catalog_status"].snapshot)
+    assert MARKER not in json.dumps(trimmed)
+    assert trimmed["status"]["controller"]["activation"]["recentFailureCount"] == 1
+
+
+def test_flowctl_log_read_has_no_follow():
+    t = flowctl.table()
+    assert build_argv(t, t.verbs["logs_read"], {"task": "a/b"}) == ["logs", "-o", "json", "--task", "a/b", "--since", "24h"]
 
 
 @pytest.mark.parametrize("name", ["Early_Signal/jev-datagen/cart_updates", "acme/a", "a.b/c-d_e", "Ünï/tèst"])

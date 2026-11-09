@@ -24,50 +24,12 @@
     "duration": "(\\d+(s|m|h|d))+"
   },
   "verbs": {
-    "catalog_list": {
-      "argv": ["catalog", "list", "--flows", "-o", "json"],
-      "mode": "once",
-      "args": {
-        "prefix": {"type": "catalog_prefix", "flag": "--prefix"}
-      }
-    },
-    "catalog_status": {
-      "argv": ["catalog", "status", "-o", "json"],
-      "mode": "once",
-      "args": {
-        "names": {"type": "catalog_name", "many": true, "required": true}
-      }
-    },
-    "catalog_history": {
-      "argv": ["catalog", "history", "-o", "json"],
-      "mode": "once",
-      "args": {
-        "name": {"type": "catalog_name", "flag": "--name", "required": true}
-      }
-    },
-    "raw_stats": {
-      "argv": ["raw", "stats", "-o", "json"],
-      "mode": "once",
-      "args": {
-        "task": {"type": "catalog_name", "flag": "--task", "required": true},
-        "since": {"type": "duration", "flag": "--since", "default": "24h"}
-      }
-    },
-    "raw_list_shards": {
-      "argv": ["raw", "list-shards", "-o", "json"],
-      "mode": "once",
-      "args": {
-        "task": {"type": "catalog_name", "flag": "--task", "required": true}
-      }
-    },
-    "logs_follow": {
-      "argv": ["logs", "--follow", "-o", "json"],
-      "mode": "stream",
-      "snapshot": false,
-      "args": {
-        "task": {"type": "catalog_name", "flag": "--task", "required": true},
-        "since": {"type": "duration", "flag": "--since", "default": "1h"}
-      }
-    }
+    "catalog_list": {"argv": ["catalog", "list", "--flows", "-o", "json"], "mode": "once", "args": {"prefix": {"type": "catalog_prefix", "flag": "--prefix"}}, "snapshot": {"keep": ["catalogName", "liveSpec.catalogType", "liveSpec.isDisabled", "liveSpec.updatedAt", "liveSpec.readsFrom", "liveSpec.writesTo", "liveSpec.readBy", "liveSpec.writtenBy", "status.type"], "first_line": ["status.summary"]}},
+    "catalog_status": {"argv": ["catalog", "status", "-o", "json"], "mode": "once", "args": {"names": {"type": "catalog_name", "many": true, "required": true}}, "snapshot": {"keep": ["catalogName", "catalogType", "liveSpecUpdatedAt", "status.type", "status.controller.updatedAt", "status.controller.failures", "status.controller.activation.lastActivatedAt", "status.controller.activation.recentFailureCount"], "first_line": ["status.summary"]}},
+    "catalog_history": {"argv": ["catalog", "history", "-o", "json"], "mode": "once", "args": {"name": {"type": "catalog_name", "flag": "--name", "required": true}}, "snapshot": {"keep": ["catalog_name", "catalog_type", "publication.publicationId", "publication.publishedAt"]}},
+    "raw_stats": {"argv": ["raw", "stats", "-o", "json"], "mode": "once", "args": {"task": {"type": "catalog_name", "flag": "--task", "required": true}, "since": {"type": "duration", "flag": "--since", "default": "24h"}}, "snapshot": {"raw": true}},
+    "raw_list_shards": {"argv": ["raw", "list-shards", "-o", "json"], "mode": "once", "args": {"task": {"type": "catalog_name", "flag": "--task", "required": true}}, "snapshot": {"keep": ["spec.id", "spec.disable", "modRevision", "createRevision", "route.primary"]}},
+    "logs_read": {"argv": ["logs", "-o", "json"], "mode": "once", "snapshot": {"keep": ["ts", "level", "shard.name", "shard.kind", "_meta.uuid"], "first_line": ["message"], "numbers": ["fields"]}, "args": {"task": {"type": "catalog_name", "flag": "--task", "required": true}, "since": {"type": "duration", "flag": "--since", "default": "24h"}}},
+    "logs_follow": {"argv": ["logs", "--follow", "-o", "json"], "mode": "stream", "snapshot": {"keep": ["ts", "level", "shard.name", "shard.kind", "_meta.uuid"], "first_line": ["message"], "numbers": ["fields"]}, "args": {"task": {"type": "catalog_name", "flag": "--task", "required": true}, "since": {"type": "duration", "flag": "--since", "default": "1h"}}}
   }
 }
