@@ -19,11 +19,15 @@
   ],
   "types": {
     "profile": "[A-Za-z0-9_][A-Za-z0-9_-]*",
+    "connector": "source-(postgres|mysql|sqlserver|mongodb|snowflake)|materialize-(motherduck|snowflake|bigquery|postgres|iceberg)",
+    "data_plane": "ops/dp/public/[a-z0-9-]+",
     "catalog_name": "(?!.*\\.\\.)[^\\W][\\w.-]*(/[\\w.-]+)+",
     "catalog_prefix": "(?!.*\\.\\.)[^\\W][\\w.-]*(/[\\w.-]+)*/",
     "duration": "(\\d+(s|m|h|d))+"
   },
   "verbs": {
+    "connector_schema": {"argv": ["raw", "get", "--table", "connector_tags", "--query", "select=image_tag,endpoint_spec_schema,connectors!inner(image_name)", "--query", "order=image_tag.desc", "--query", "limit=1"], "mode": "once", "output": "document", "snapshot": {"keep": ["image_tag", "connectors.image_name"]}, "args": {"image": {"type": "connector", "flag": "--query", "required": true, "format": "connectors.image_name=eq.ghcr.io/estuary/{}"}}},
+    "discover": {"argv": ["discover", "--source", "flow.yaml", "--flat"], "mode": "handler", "snapshot": false, "timeout": 300, "args": {"data_plane": {"type": "data_plane", "flag": "--data-plane"}}},
     "auth_login": {"argv": ["auth", "login"], "mode": "login", "snapshot": false, "timeout": 600},
     "catalog_list": {"argv": ["catalog", "list", "--flows", "-o", "json"], "mode": "once", "args": {"prefix": {"type": "catalog_prefix", "flag": "--prefix"}}, "snapshot": {"keep": ["catalogName", "liveSpec.catalogType", "liveSpec.isDisabled", "liveSpec.updatedAt", "liveSpec.readsFrom", "liveSpec.writesTo", "liveSpec.readBy", "liveSpec.writtenBy", "status.type"], "first_line": ["status.summary"]}},
     "catalog_status": {"argv": ["catalog", "status", "-o", "json"], "mode": "once", "args": {"names": {"type": "catalog_name", "many": true, "required": true}}, "snapshot": {"keep": ["catalogName", "catalogType", "liveSpecUpdatedAt", "status.type", "status.controller.updatedAt", "status.controller.failures", "status.controller.activation.lastActivatedAt", "status.controller.activation.recentFailureCount"], "first_line": ["status.summary"]}},

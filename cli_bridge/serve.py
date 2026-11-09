@@ -5,10 +5,12 @@ import queue
 import re
 import sys
 import threading
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Any, Callable
 
-from .run import Job, default_snapshot_root, run_login, run_once, run_stream, tool_version
+from .run import Job, default_snapshot_root, default_work_root, run_login, run_once, run_stream, sweep_work, tool_version
 from .table import BadRequest, Table, build_argv
 
 PROTOCOL_VERSION = 1
@@ -17,6 +19,16 @@ MAX_SECRET_LENGTH = 16_384
 # A token has no spaces or line breaks, so it can't add anything to what the terminal receives.
 SECRET = re.compile(r"[\x21-\x7e]+")
 SHUTDOWN_WAIT_SECONDS = 8.0
+
+
+@dataclass(frozen=True)
+class Handler:
+    """A tool's command that needs more than running: `check` validates the request's "input" and
+    raises BadRequest, without repeating it. `run` returns the result. Input can hold secrets, so
+    neither may log it, and an unexpected failure here is reported without any detail."""
+
+    check: Callable[[Any], Any]
+    run: Callable[..., dict]
 
 
 def bridge_version() -> str:
@@ -47,9 +59,12 @@ def tool_report(table: Table) -> dict:
 
 
 class Server:
-    def __init__(self, table: Table, stdin, stdout, snapshot_root: Path | None = None):
+    def __init__(self, table: Table, stdin, stdout, snapshot_root: Path | None = None,
+                 handlers: dict[str, Handler] | None = None, work_root: Path | None = None):
         self.table, self.stdin, self.stdout = table, stdin, stdout
         self.snapshot_root = snapshot_root or default_snapshot_root()
+        self.handlers = handlers or {}
+        self.work_root = work_root or default_work_root()
         self._write_lock = threading.Lock()
         self._jobs: dict[str, tuple[Job, threading.Thread]] = {}
         self._jobs_lock = threading.Lock()
@@ -123,8 +138,13 @@ class Server:
 
     def start(self, rid: str, kind: str, request: dict) -> None:
         verb = self.table.verbs[kind]
+        checked = None
         try:
             argv = build_argv(self.table, verb, request.get("args"), request.get("profile"))
+            if verb.mode == "handler":
+                if kind not in self.handlers:
+                    raise BadRequest(f"{kind} isn't available in this engine")
+                checked = self.handlers[kind].check(request.get("input"))
         except BadRequest as e:
             self.error(rid, str(e))
             return
@@ -138,14 +158,16 @@ class Server:
                 self.error(rid, f"request {rid} is already running")
                 return
             job = Job()
-            thread = threading.Thread(target=self._run, args=(rid, verb, binary, argv, job), daemon=True)
+            thread = threading.Thread(target=self._run, args=(rid, verb, binary, argv, job, checked), daemon=True)
             self._jobs[rid] = (job, thread)
         self.send({"id": rid, "type": "accepted"})
         thread.start()
 
-    def _run(self, rid, verb, binary, argv, job) -> None:
+    def _run(self, rid, verb, binary, argv, job, checked=None) -> None:
         try:
-            if verb.mode == "login":
+            if verb.mode == "handler":
+                result = self._run_handler(verb, binary, argv, job, checked)
+            elif verb.mode == "login":
                 result = run_login(verb, binary, argv, job, lambda: self.send({"id": rid, "type": "event", "event": "waiting"}))
             elif verb.mode == "stream":
                 def on_line(fields):
@@ -159,6 +181,12 @@ class Server:
             self._jobs.pop(rid, None)
         self.send({"id": rid, "type": "result", "result": result})
 
+    def _run_handler(self, verb, binary, argv, job, checked) -> dict:
+        try:
+            return self.handlers[verb.name].run(self.table, verb, binary, argv, job, checked, self.work_root)
+        except Exception:  # Its details could quote the input, so none of them go anywhere.
+            return {"ok": False, "error": f"{verb.name} failed unexpectedly.", "code": "tool_error", "exit": None}
+
     def stop_all(self) -> None:
         with self._jobs_lock:
             entries = list(self._jobs.values())
@@ -169,6 +197,7 @@ class Server:
                 thread.join(SHUTDOWN_WAIT_SECONDS)
 
     def serve(self) -> None:
+        sweep_work(self.work_root, self.table.device)
         for line in self.stdin:
             if not line.strip():
                 continue
@@ -182,5 +211,5 @@ class Server:
         self.stop_all()  # end of input
 
 
-def serve_table(table: Table) -> None:
-    Server(table, sys.stdin, sys.stdout).serve()
+def serve_table(table: Table, handlers: dict[str, Handler] | None = None) -> None:
+    Server(table, sys.stdin, sys.stdout, handlers=handlers).serve()

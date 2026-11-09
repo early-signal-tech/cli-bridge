@@ -11,9 +11,10 @@ import time
 import pytest
 
 from cli_bridge.run import MAX_SNAPSHOT_TEXT, trim_row
-from cli_bridge.serve import Server, tool_report
+from cli_bridge.serve import Handler, Server, tool_report
 from cli_bridge.table import BadRequest, SnapshotRule, build_argv, load_table
 from cli_bridge.tools import flowctl
+from cli_bridge.tools.flowctl import discover as flowctl_discover
 
 # Longer than any fragment check below, and nothing like a real token.
 FAKE_TOKEN = "zqx7.vkj2-pwm9qlt4-hdn6rcb3-yfg8swa5-jzk1xeu0.mnb4vcz7"
@@ -43,6 +44,34 @@ elif cmd == "sensitive":
     if "--follow" in args:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         time.sleep(30)
+elif cmd == "discover":
+    spec = json.load(open("flow.yaml"))
+    name, capture = next(iter(spec["captures"].items()))
+    config = capture["endpoint"]["connector"]["config"]
+    secret = config.get("password", "")
+    how = config.get("how", "ok")
+    with open(os.environ["FAKE_FOLDER"], "a") as f: f.write(os.getcwd() + "\n")
+    if how == "fail":
+        print("2026 discover>  INFO: connecting\n2026 discover> ERROR: bad password: " + secret)
+        sys.stderr.write("Error: failed " + secret + "\n"); sys.exit(1)
+    if how == "login":
+        sys.stderr.write("Error: no valid login here\n"); sys.exit(1)
+    if how == "hang":
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)
+    print("noise with " + secret)
+    if how == "plain":
+        pass  # Leaves the config as it was.
+    elif how == "unencrypted":
+        config = {"address": config.get("address")}
+    else:
+        config = {"address": config.get("address"), "password_sops": "ENC[AES256_GCM,data:x]", "sops": {"mac": "x"}}
+    capture["endpoint"]["connector"]["config"] = config
+    capture["bindings"] = [{"resource": {"namespace": "public", "stream": "orders"}, "target": name + "/public/orders"}]
+    json.dump(spec, open("flow.yaml", "w"))
+elif cmd == "raw" and args[1] == "bundle":
+    print(json.dumps(json.load(open("flow.yaml")), indent=2))
+elif cmd == "document":
+    print(json.dumps([{"n": 1, "big": {"x": 1}}, {"n": 2}], indent=2))
 elif cmd == "login":
     with open(os.environ["FAKE_CALLS"], "a") as f:
         f.write(json.dumps({"tty": sys.stdin.isatty()}) + "\n")
@@ -110,6 +139,13 @@ TABLE = {
         "trimmed_many": {"argv": ["many"], "mode": "once", "snapshot": {"keep": ["n"]}},
         "trimmed_follow": {"argv": ["sensitive", "--follow"], "mode": "stream", "snapshot": RULE},
         "quiet_follow": {"argv": ["empty"], "mode": "stream", "snapshot": RULE},
+        "find": {"argv": ["discover", "--source", "flow.yaml"], "mode": "handler", "snapshot": False, "timeout": 5,
+                 "args": {"data_plane": {"type": "word", "flag": "--data-plane"}}},
+        "find_quick": {"argv": ["discover", "--source", "flow.yaml"], "mode": "handler", "snapshot": False, "timeout": 0.5},
+        "find_nothing": {"argv": ["discover"], "mode": "handler", "snapshot": False},
+        "document": {"argv": ["document"], "mode": "once", "output": "document", "snapshot": {"keep": ["n"]}},
+        "formatted": {"argv": ["rows"], "mode": "once", "snapshot": False,
+                      "args": {"name": {"type": "word", "flag": "--q", "format": "x=eq.{}"}}},
         "log_in": {"argv": ["login"], "mode": "login", "snapshot": False},
         "log_in_breaks": {"argv": ["login", "--no-prompt"], "mode": "login", "snapshot": False},
         "log_in_quick": {"argv": ["slow"], "mode": "login", "snapshot": False, "timeout": 0.3},
@@ -136,7 +172,10 @@ class Client:
                     client.messages.put(json.loads(line))
                 return len(text)
 
-        self.server = Server(table, self.stdin, Out(), snapshot_root=snapshots)
+        self.work = snapshots.parent / "Work"
+        finder = Handler(flowctl_discover.check, flowctl_discover.run)
+        self.server = Server(table, self.stdin, Out(), snapshot_root=snapshots, work_root=self.work,
+                             handlers={"find": finder, "find_quick": finder})
         self.thread = threading.Thread(target=self.server.serve, daemon=True)
         self.thread.start()
 
@@ -177,6 +216,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_LINES", str(lines))
     monkeypatch.setenv("FAKE_GOOD_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("FAKE_SAVED", str(tmp_path / "tool-saved-it"))
+    monkeypatch.setenv("FAKE_FOLDER", str(tmp_path / "ran-in"))
     path = tmp_path / "table.json"
     path.write_text(json.dumps(TABLE))
     return {"table": load_table(path), "snapshots": tmp_path / "Snapshots", "calls": calls, "tool": tool}
@@ -350,6 +390,162 @@ def test_a_running_id_cant_be_reused(client):
     client.until("r", "error")
     client.send(id="s", type="stop", request="r")
     client.until("r", "result")
+
+
+# discover
+
+PASSWORD = "zqx7-vkj2-made-up-pw"
+
+
+def find_input(how="ok", password=PASSWORD, **extra):
+    return {"name": "acme/pg", "image": "ghcr.io/estuary/source-postgres:v3", "secret_paths": ["password"],
+            "config": {"address": "db:5432", "password": password, "how": how}, **extra}
+
+
+def assert_nothing_left(env, client, sent=""):
+    """No folder, no snapshot, and no piece of the password in anything sent or saved."""
+    assert list(client.work.rglob("*")) == [] or all(p.is_dir() for p in client.work.rglob("*"))
+    assert not env["snapshots"].exists()
+    for piece in fragments(PASSWORD):
+        assert piece not in sent
+
+
+def test_discover_returns_the_encrypted_catalog_and_deletes_its_folder(env, client):
+    r = client.result(id="d", type="find", profile="me", args={"data_plane": "plane"}, input=find_input())
+    assert r["ok"] and r["bindings"] == [{"target": "acme/pg/public/orders", "resource": {"namespace": "public", "stream": "orders"}}]
+    config = r["catalog"]["captures"]["acme/pg"]["endpoint"]["connector"]["config"]
+    assert "password_sops" in config and "sops" in config and "password" not in config
+    assert_nothing_left(env, client, json.dumps(r))
+    ran_in = (env["tool"].parent / "ran-in").read_text().strip()
+    assert ran_in.startswith(str(client.work)) and not os.path.exists(ran_in)
+    assert stat.S_IMODE(os.stat(client.work / "fake1").st_mode) == 0o700
+    argv = [c for c in calls(env) if "discover" in c][0]
+    assert argv == ["-P", "me", "discover", "--source", "flow.yaml", "--data-plane", "plane"]
+    assert ["-P", "me", "raw", "bundle", "--source", "flow.yaml", "-o", "json"] in calls(env)
+
+
+def test_a_secret_is_never_an_argument(env, client):
+    client.result(id="d", type="find", input=find_input())
+    assert PASSWORD not in json.dumps(calls(env))
+
+
+@pytest.mark.parametrize("how,code", [("fail", "tool_error"), ("plain", "secret_left"), ("unencrypted", "secret_left")])
+def test_no_piece_of_a_secret_gets_out_however_discover_ends(env, tmp_path, capfd, how, code):
+    client = Client(env["table"], env["snapshots"])
+    client.send(id="d", type="find", input=find_input(how))
+    result = client.until("d", "result")["result"]
+    client.close()
+    assert not result["ok"] and result["code"] == code and "catalog" not in result
+    sent = json.dumps(result) + everything_sent(client)
+    out, err = capfd.readouterr()
+    assert_nothing_left(env, client, sent + out + err)
+
+
+def test_a_failed_discover_explains_with_the_secret_taken_out(client):
+    r = client.result(id="d", type="find", input=find_input("fail"))
+    assert r["error"] == "bad password: [hidden]"
+    assert r["exit"] == 1
+
+
+def test_discover_keeps_the_tools_error_codes(client):
+    assert client.result(id="d", type="find", input=find_input("login"))["code"] == "not_logged_in"
+
+
+def test_stop_ends_a_discover_and_deletes_its_folder(env, client):
+    client.send(id="d", type="find", input=find_input("hang"))
+    client.until("d", "accepted")
+    folder = env["tool"].parent / "ran-in"
+    deadline = time.time() + 5
+    while not folder.exists() and time.time() < deadline:
+        time.sleep(0.02)
+    client.send(id="s", type="stop", request="d")
+    r = client.until("d", "result")["result"]
+    assert r["stopped"] and not r["ok"]
+    assert_nothing_left(env, client, json.dumps(r))
+
+
+def test_a_discover_that_hangs_times_out_and_deletes_its_folder(env, client):
+    r = client.result(id="d", type="find_quick", input=find_input("hang"))
+    assert not r["ok"] and r["code"] == "timeout"
+    assert_nothing_left(env, client, json.dumps(r))
+
+
+def test_an_unexpected_failure_says_nothing(env, monkeypatch):
+    def explode(*_):
+        raise ValueError(PASSWORD)
+    c = Client(env["table"], env["snapshots"])
+    c.server.handlers = {"find": Handler(flowctl_discover.check, explode)}
+    r = c.result(id="d", type="find", input=find_input())
+    c.close()
+    assert r["error"] == "find failed unexpectedly." and PASSWORD not in json.dumps(r)
+
+
+@pytest.mark.parametrize("bad", [
+    None, "text", {},
+    find_input(name="nope"),
+    find_input(name="-x/y"),
+    find_input(image="ghcr.io/evil/source-postgres:v3"),
+    find_input(image="ghcr.io/estuary/source-postgres:v3 --rm"),
+    find_input(image="ghcr.io/estuary/source-http-ingest:v1"),
+    find_input(config="text"),
+    find_input(secret_paths="password"),
+    find_input(secret_paths=[1]),
+    find_input(password="x" * 1_100_000),
+])
+def test_a_bad_discover_never_runs_and_doesnt_repeat_its_input(env, client, bad):
+    client.send(id="d", type="find", input=bad)
+    m = client.until("d", "error")
+    assert m["code"] == "bad_request" and calls(env) == [] and PASSWORD not in json.dumps(m)
+    assert not client.work.exists()
+
+
+def test_a_handler_verb_without_a_handler_is_refused(env, client):
+    client.send(id="d", type="find_nothing", input=find_input())
+    assert client.until("d", "error")["code"] == "bad_request"
+    assert calls(env) == []
+
+
+def test_a_crashed_runs_folder_is_swept_at_start_and_a_recent_one_isnt(env):
+    work = env["snapshots"].parent / "Work" / "fake1"
+    old, recent = work / "run-old", work / "run-recent"
+    old.mkdir(parents=True)
+    recent.mkdir()
+    (old / "flow.yaml").write_text(PASSWORD)
+    os.utime(old, (time.time() - 7200, time.time() - 7200))
+    c = Client(env["table"], env["snapshots"])
+    c.send(id="h", type="hello")
+    c.until("h", "hello")
+    c.close()
+    assert not old.exists() and recent.exists()
+
+
+def test_hide_takes_out_every_form_of_a_secret():
+    assert flowctl_discover.hide('a "b" and a \\"b\\"', ['a "b"']) == "[hidden] and [hidden]"
+    secret = "line-one-of-key\nline-two-of-key"
+    assert flowctl_discover.hide("x line-two-of-key y", [secret]) == "x [hidden] y"
+    assert flowctl_discover.hide(json.dumps(secret), [secret]) == '"[hidden]"'
+
+
+def test_secret_paths_reach_nested_fields_and_skip_what_isnt_there():
+    checked = flowctl_discover.check({"name": "a/b", "image": "ghcr.io/estuary/source-mysql:v3", "secret_paths": ["credentials.password", "x.y", "a"],
+                                      "config": {"credentials": {"password": "abc"}, "a": ""}})
+    assert checked["secrets"] == ["abc"]
+
+
+# A document's rows, and an argument's format
+
+
+def test_a_document_verb_reads_one_value_and_saves_by_its_rule(client):
+    r = client.result(id="r", type="document")
+    assert r["rows"] == [{"n": 1, "big": {"x": 1}}, {"n": 2}] and r["bad_lines"] == 0
+    assert [json.loads(line) for line in open(r["snapshot"])] == [{"n": 1}, {"n": 2}]
+
+
+def test_an_argument_can_be_formatted_after_its_checked(env, client):
+    client.result(id="r", type="formatted", args={"name": "abc"})
+    assert calls(env)[-1] == ["rows", "--q", "x=eq.abc"]
+    client.send(id="b", type="formatted", args={"name": "a;b"})
+    client.until("b", "error")
 
 
 # login
@@ -639,19 +835,41 @@ def test_garbage_and_missing_ids_get_errors(client):
 # flowctl's table
 
 
-def test_flowctl_table_only_reads_and_logs_in_for_now():
+def test_flowctl_table_only_reads_logs_in_and_discovers_for_now():
     """This PR's scope. Drafts and publish arrive in their own PRs and change this test on purpose."""
     t = flowctl.table()
     assert set(t.verbs) == {"catalog_list", "catalog_status", "catalog_history", "raw_stats", "raw_list_shards",
-                            "logs_read", "logs_follow", "auth_login"}
+                            "logs_read", "logs_follow", "auth_login", "connector_schema", "discover"}
     words = {word for verb in t.verbs.values() for word in verb.argv}
     words |= {a.flag for verb in t.verbs.values() for a in verb.args}
-    for banned in ("publish", "delete", "draft", "token", "--token", "discover", "preview", "update", "rpc", "--models",
+    for banned in ("publish", "delete", "draft", "token", "--token", "preview", "update", "rpc", "--models",
                    "--auto-approve", "--dangerous-auto-approve"):
         assert banned not in words
     assert [name for name, verb in t.verbs.items() if "auth" in verb.argv] == ["auth_login"]
     login = t.verbs["auth_login"]
     assert login.argv == ("auth", "login") and login.mode == "login" and login.snapshot is None and not login.args
+
+
+def test_flowctl_discover_is_wired_up_and_saves_nothing():
+    t = flowctl.table()
+    assert t.verbs["discover"].mode == "handler" and t.verbs["discover"].snapshot is None
+    assert set(flowctl.HANDLERS) == {"discover"}
+    assert build_argv(t, t.verbs["discover"], {"data_plane": "ops/dp/public/aws-us-east-1-c1"}, "me") == [
+        "--profile", "me", "discover", "--source", "flow.yaml", "--flat", "--data-plane", "ops/dp/public/aws-us-east-1-c1"]
+    with pytest.raises(BadRequest):
+        build_argv(t, t.verbs["discover"], {"data_plane": "elsewhere/x"})
+
+
+@pytest.mark.parametrize("name,ok", [("source-postgres", True), ("materialize-iceberg", True), ("source-http-ingest", False),
+                                     ("source-postgres&x=1", False), ("materialize-postgres,y", False)])
+def test_flowctl_connector_schema_only_asks_about_panel_connectors(name, ok):
+    t = flowctl.table()
+    verb = t.verbs["connector_schema"]
+    if ok:
+        assert f"connectors.image_name=eq.ghcr.io/estuary/{name}" in build_argv(t, verb, {"image": name})
+    else:
+        with pytest.raises(BadRequest):
+            build_argv(t, verb, {"image": name})
 
 
 def test_flowctl_only_saves_stats_raw():

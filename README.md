@@ -58,6 +58,29 @@ and then fails ends with a result of `{"ok": false, "error": "…", "code": "…
 `code` comes from the tool's table where one matches, such as `not_logged_in`. End of input
 stops everything and exits.
 
+## Discovering
+
+`flowctl discover` only reads a spec from a file, so a connector's config, passwords included,
+has to be on disk while it runs. It's the one command that holds real secrets:
+
+```
+-> {"id": "8", "type": "discover", "profile": "default", "args": {"data_plane": "ops/dp/public/…"},
+    "input": {"name": "acme/pg", "image": "ghcr.io/estuary/source-postgres:v3",
+              "config": {...}, "secret_paths": ["credentials.password"]}}
+<- {"id": "8", "type": "accepted"}
+<- {"id": "8", "type": "result", "result": {"ok": true, "catalog": {...}, "bindings": [...]}}
+```
+
+On success flowctl swaps the secrets for encrypted ones (Estuary's KMS). On failure the plain
+text stays in the file. So:
+
+- It runs in a private folder under `Duck Harness/Work`, deleted however the run ends. A crash
+  can't delete anything, so a folder over an hour old is swept by the next engine or discover.
+- Errors have the secrets taken out, and no refusal repeats the input.
+- The result is checked. A secret still in it, or a config that isn't encrypted, returns
+  `secret_left` and nothing else.
+- Nothing is snapshotted, and an unexpected failure is reported with no detail.
+
 ## Logging in
 
 `flowctl auth login` opens its token page and waits for a token at a terminal. So a `login`
@@ -99,6 +122,9 @@ entry has to say what it saves, and a table that leaves that out won't load:
 
 The face still gets every row whole, so it can show detail live. A stream's rule applies line
 by line, and a stream that sent nothing leaves no file.
+
+`connector_schema` saves only the connector's name and tag. `auth_login` and `discover` hold
+secrets, so they save nothing, and a table that says otherwise won't load.
 
 flowctl's rules leave out publishers' emails and names, connector config, and error details.
 Failing documents appear in a log line's details, so logs keep the time, level, shard, the
