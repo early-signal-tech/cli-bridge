@@ -3,7 +3,6 @@
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import tempfile
@@ -12,10 +11,11 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .table import Table, Verb
+from .table import SnapshotRule, Table, Verb
 
 KILL_AFTER_SECONDS = 5.0
 MAX_ERROR_CHARS = 2000
+MAX_SNAPSHOT_TEXT = 200
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
@@ -36,19 +36,125 @@ def summarize_stderr(table: Table, raw: bytes) -> str:
     return "\n".join(lines)[:MAX_ERROR_CHARS]
 
 
-def save_snapshot(tmp_path: str, root: Path, device: str, verb: str) -> str:
-    """Move the raw stdout to <root>/<device>/<time>_<verb>.jsonl. Only this user can read it."""
+_MISSING = object()
+
+
+def _get(row: dict, path: str):
+    value = row
+    for part in path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return _MISSING
+        value = value[part]
+    return value
+
+
+def _put(row: dict, path: str, value) -> None:
+    *parents, last = path.split(".")
+    for part in parents:
+        row = row.setdefault(part, {})
+    row[last] = value
+
+
+def trim_row(row, rule: SnapshotRule) -> dict | None:
+    """Only what the rule names, or None if that's nothing."""
+    if not isinstance(row, dict):
+        return None
+    out: dict = {}
+    for path in rule.keep:
+        value = _get(row, path)
+        if value is not _MISSING:
+            _put(out, path, value)
+    for path in rule.first_line:
+        value = _get(row, path)
+        if isinstance(value, str):
+            lines = value.splitlines()
+            _put(out, path, lines[0][:MAX_SNAPSHOT_TEXT] if lines else "")
+    for path in rule.numbers:
+        value = _get(row, path)
+        if isinstance(value, dict):
+            numbers = {k: v for k, v in value.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            if numbers:
+                _put(out, path, numbers)
+    return out or None
+
+
+def _open_snapshot(root: Path, device: str, verb: str):
+    """A new <root>/<device>/<time>_<verb>.jsonl. Only this user can read it, from the start."""
     folder = root / device
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(folder, 0o700)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    target = folder / f"{stamp}_{verb}.jsonl"
     n = 1
-    while target.exists():  # two of the same verb in one second
-        n += 1
-        target = folder / f"{stamp}_{verb}_{n}.jsonl"
-    shutil.move(tmp_path, target)
-    os.chmod(target, 0o600)
+    while True:
+        name = f"{stamp}_{verb}.jsonl" if n == 1 else f"{stamp}_{verb}_{n}.jsonl"
+        target = folder / name
+        try:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:  # two of the same verb in one second
+            n += 1
+            continue
+        return target, os.fdopen(fd, "w", encoding="utf-8")
+
+
+class TrimmedSnapshot:
+    """Writes rows through a rule as they arrive. A snapshot that fails shouldn't cost the face
+    its result, so it deletes what it wrote and says why in `error`."""
+
+    def __init__(self, rule: SnapshotRule, root: Path, device: str, verb: str):
+        self.rule, self.path, self.file, self.error = rule, None, None, None
+        try:
+            self.path, self.file = _open_snapshot(root, device, verb)
+        except OSError as e:
+            self.error = str(e)
+
+    def add(self, row) -> None:
+        trimmed = trim_row(row, self.rule)
+        if self.file is None or trimmed is None:
+            return
+        try:
+            self.file.write(json.dumps(trimmed) + "\n")
+            self.file.flush()  # A stream can run for days: what's arrived should survive a crash.
+        except OSError as e:
+            self.error = str(e)
+            self._drop()
+
+    def finish(self, keep_empty: bool = True) -> str | None:
+        """Close it. Its path, or None if there's nothing to show for it."""
+        if self.file is None:
+            return None
+        try:
+            self.file.close()
+            self.file = None
+        except OSError as e:
+            self.error = str(e)
+            self._drop()
+            return None
+        if not keep_empty and os.path.getsize(self.path) == 0:
+            os.unlink(self.path)
+            return None
+        return str(self.path)
+
+    def _drop(self) -> None:
+        if self.file is not None:
+            try:
+                self.file.close()
+            except OSError:
+                pass
+            self.file = None
+        if self.path is not None and os.path.exists(self.path):
+            os.unlink(self.path)
+
+
+def save_raw_snapshot(tmp_path: str, root: Path, device: str, verb: str) -> str:
+    """Copy stdout as it came, for a verb whose rule says that's safe."""
+    target, file = _open_snapshot(root, device, verb)
+    try:
+        with file, open(tmp_path, encoding="utf-8", errors="replace") as source:
+            for line in source:
+                file.write(line)
+    except OSError:
+        os.unlink(target)
+        raise
     return str(target)
 
 
@@ -120,6 +226,8 @@ def run_once(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, s
             if exit_code != 0:
                 return _failure(table, stderr, exit_code)
 
+        rule = verb.snapshot
+        trimmed = TrimmedSnapshot(rule, snapshot_root, table.device, verb.name) if rule and not rule.raw else None
         rows: deque = deque(maxlen=table.max_rows)
         count = bad_lines = 0
         with open(tmp_path, "rb") as lines:
@@ -127,16 +235,24 @@ def run_once(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, s
                 if not line.strip():
                     continue
                 try:
-                    rows.append(json.loads(line))
-                    count += 1
+                    row = json.loads(line)
                 except json.JSONDecodeError:
-                    bad_lines += 1
+                    bad_lines += 1  # Never saved by a trimmed snapshot: there's no telling what it holds.
+                    continue
+                rows.append(row)
+                count += 1
+                if trimmed:
+                    trimmed.add(row)
 
         result = {"ok": True, "rows": list(rows), "count": count, "truncated": count > len(rows),
                   "bad_lines": bad_lines, "snapshot": None}
-        if verb.snapshot:
+        if trimmed:
+            result["snapshot"] = trimmed.finish()
+            if trimmed.error:
+                result["snapshot_error"] = trimmed.error
+        elif rule:
             try:
-                result["snapshot"] = save_snapshot(tmp_path, snapshot_root, table.device, verb.name)
+                result["snapshot"] = save_raw_snapshot(tmp_path, snapshot_root, table.device, verb.name)
             except OSError as e:
                 # The data is good. A snapshot that can't be saved shouldn't cost the face its result.
                 result["snapshot_error"] = str(e)
@@ -146,8 +262,10 @@ def run_once(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, s
             os.unlink(tmp_path)
 
 
-def run_stream(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, on_line) -> dict:
-    """Run until the tool exits or stop arrives, sending each line as it comes."""
+def run_stream(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, on_line, snapshot_root: Path) -> dict:
+    """Run until the tool exits or stop arrives, sending each line as it comes. The face gets each
+    line whole; a verb's rule says what of it is saved. A stream that sent nothing leaves no file."""
+    trimmed = TrimmedSnapshot(verb.snapshot, snapshot_root, table.device, verb.name) if verb.snapshot else None
     with tempfile.TemporaryFile() as stderr:
         proc = job.spawn([binary, *argv], subprocess.PIPE, stderr)
         lines = 0
@@ -157,16 +275,25 @@ def run_stream(table: Table, verb: Verb, binary: str, argv: list[str], job: Job,
             lines += 1
             text = raw.decode("utf-8", "replace").rstrip("\r\n")
             try:
-                on_line({"line": json.loads(text)})
+                row = json.loads(text)
             except json.JSONDecodeError:
                 on_line({"text": text})
+                continue
+            if trimmed:
+                trimmed.add(row)
+            on_line({"line": row})
         proc.stdout.close()
         exit_code = proc.wait()
+        saved = {}
+        if trimmed:
+            saved["snapshot"] = trimmed.finish(keep_empty=False)
+            if trimmed.error:
+                saved["snapshot_error"] = trimmed.error
         if job.stopped:
-            return {"ok": True, "lines": lines, "stopped": True}
+            return {"ok": True, "lines": lines, "stopped": True, **saved}
         if exit_code != 0:
-            return {**_failure(table, stderr, exit_code), "lines": lines, "stopped": False}
-        return {"ok": True, "lines": lines, "stopped": False}
+            return {**_failure(table, stderr, exit_code), "lines": lines, "stopped": False, **saved}
+        return {"ok": True, "lines": lines, "stopped": False, **saved}
 
 
 def tool_version(table: Table, binary: str) -> str | None:

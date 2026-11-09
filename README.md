@@ -21,6 +21,7 @@ background and talks to it over JSON Lines on stdin/stdout. It has no UI of its 
 - **Every argument is checked.** Each has a type with a pattern, and no value can start
   with `-`, so a value can't turn into a flag.
 - **No shell.** Commands run directly, with stdin closed.
+- **Snapshots hold only what a verb's rule names.** See below.
 - **The tool keeps its own login.** The engine doesn't read, store or pass credentials.
   Today it has no login command at all: run `flowctl auth login` in a terminal.
 
@@ -59,7 +60,7 @@ stops everything and exits.
 
 ## Snapshots
 
-A successful `once` result saves the tool's raw stdout to
+Results are saved to
 `~/Library/Application Support/Duck Harness/Snapshots/<device>/<time>_<verb>.jsonl`, with the
 time in UTC. Only you can read the folder and files. Nothing reads them yet. DuckDB can:
 
@@ -68,8 +69,24 @@ SELECT * FROM read_json('~/Library/Application Support/Duck Harness/Snapshots/es
                         format = 'newline_delimited', union_by_name = true, filename = true);
 ```
 
-Verbs that could carry secrets or customer data set `"snapshot": false`. Log follows do,
-because a connector's error can quote the data it was handling.
+An agent may read these files, and what it reads leaves this machine. So each verb's table
+entry has to say what it saves, and a table that leaves that out won't load:
+
+| Rule | Saves |
+|---|---|
+| `"snapshot": false` | Nothing. |
+| `"snapshot": {"keep": [...], "first_line": [...], "numbers": [...]}` | Only these dotted paths. `keep` copies a value whole, `first_line` takes a text's first line (200 characters at most), and `numbers` takes an object's numeric values. A line that isn't JSON is never saved. |
+| `"snapshot": {"raw": true}` | stdout as it came, for output that can't carry secrets or customer data. |
+
+The face still gets every row whole, so it can show detail live. A stream's rule applies line
+by line, and a stream that sent nothing leaves no file.
+
+flowctl's rules leave out publishers' emails and names, connector config, and error details.
+Failing documents appear in a log line's details, so logs keep the time, level, shard, the
+first line of the message and numeric fields. This can't catch everything: a connector could
+quote a value in that first line. `_meta.uuid` is kept so a follow and a `logs_read` over the
+same time can be de-duplicated. `logs_read` catches up on what happened while nothing was
+following.
 
 ## Development
 

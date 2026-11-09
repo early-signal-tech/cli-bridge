@@ -122,7 +122,7 @@ class Server:
             if verb.mode == "stream":
                 def on_line(fields):
                     self.send({"id": rid, "type": "event", "event": "line", **fields})
-                result = run_stream(self.table, verb, binary, argv, job, on_line)
+                result = run_stream(self.table, verb, binary, argv, job, on_line, self.snapshot_root)
             else:
                 result = run_once(self.table, verb, binary, argv, job, self.snapshot_root)
         except OSError as e:
