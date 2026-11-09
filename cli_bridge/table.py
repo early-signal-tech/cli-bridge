@@ -11,7 +11,7 @@ MAX_VALUE_LENGTH = 512
 MAX_VALUES = 100
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_ROWS = 20_000
-MODES = ("once", "stream")
+MODES = ("once", "stream", "login")
 
 
 class BadRequest(Exception):
@@ -108,6 +108,8 @@ def _load_snapshot_rule(verb: str, spec: dict) -> SnapshotRule | None:
     rule = spec["snapshot"]
     if rule is False:
         return None
+    if spec["mode"] == "login":
+        raise ValueError(f"verb {verb}: a login is never saved, so its snapshot has to be false")
     if not isinstance(rule, dict) or set(rule) - {"raw", "keep", "first_line", "numbers"}:
         raise ValueError(f"verb {verb}: a snapshot rule is false, or an object of raw, keep, first_line, numbers")
     if rule.get("raw") is True:
