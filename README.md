@@ -22,8 +22,8 @@ background and talks to it over JSON Lines on stdin/stdout. It has no UI of its 
   with `-`, so a value can't turn into a flag.
 - **No shell.** Commands run directly, with stdin closed.
 - **Snapshots hold only what a verb's rule names.** See below.
-- **The tool keeps its own login.** The engine doesn't read, store or pass credentials.
-  Today it has no login command at all: run `flowctl auth login` in a terminal.
+- **The tool keeps its own login.** The engine doesn't read or store credentials. See
+  [Logging in](#logging-in).
 
 ## Protocol
 
@@ -57,6 +57,25 @@ A request that can't start (an unknown type, a bad argument, the tool isn't inst
 and then fails ends with a result of `{"ok": false, "error": "…", "code": "…", "exit": 1}`.
 `code` comes from the tool's table where one matches, such as `not_logged_in`. End of input
 stops everything and exits.
+
+## Logging in
+
+`flowctl auth login` opens its token page and waits for a token at a terminal. So a `login`
+verb runs it on a private pseudo-terminal, and hands over the token when the person has it:
+
+```
+-> {"id": "7", "type": "auth_login", "profile": "default"}
+<- {"id": "7", "type": "accepted"}
+<- {"id": "7", "type": "event", "event": "waiting"}
+-> {"id": "s", "type": "secret", "request": "7", "secret": "…"}
+<- {"id": "s", "type": "ok"}
+<- {"id": "7", "type": "result", "result": {"ok": true, "exit": 0}}
+```
+
+flowctl saves the token in its own config (mode 600), and the engine keeps no copy. flowctl's
+terminal output repeats the token in pieces, so the engine reads that output and throws it away
+without looking. The result comes only from the exit code. The token never appears in an
+argument, a log, a snapshot or a message back, and no error repeats it. `stop` cancels a login.
 
 ## Snapshots
 

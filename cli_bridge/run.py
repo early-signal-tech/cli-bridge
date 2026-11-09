@@ -1,12 +1,18 @@
 """Run one allowed command: stdin closed, no shell, in its own process group so stop reaches all of it."""
 
 import json
+import fcntl
 import os
+import pty
+import queue
 import re
+import select
 import signal
 import subprocess
 import tempfile
+import termios
 import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +22,9 @@ from .table import SnapshotRule, Table, Verb
 KILL_AFTER_SECONDS = 5.0
 MAX_ERROR_CHARS = 2000
 MAX_SNAPSHOT_TEXT = 200
+LOGIN_POLL_SECONDS = 0.1
+LOGIN_EXIT_WAIT_SECONDS = 5.0
+LOGIN_REFUSED = "That token wasn't accepted, so nothing was saved. Copy a new one from the token page and try again."
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
@@ -165,9 +174,10 @@ class Job:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
         self.stopped = False
+        self.secrets: queue.Queue | None = None  # A login that's waiting for its secret.
 
-    def spawn(self, argv: list[str], stdout, stderr) -> subprocess.Popen:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, shell=False,
+    def spawn(self, argv: list[str], stdout, stderr, stdin=subprocess.DEVNULL, preexec_fn=None) -> subprocess.Popen:
+        proc = subprocess.Popen(argv, stdin=stdin, stdout=stdout, stderr=stderr, shell=False, preexec_fn=preexec_fn,
                                 start_new_session=True, env={**os.environ, "NO_COLOR": "1"})
         with self._lock:
             self._proc = proc
@@ -294,6 +304,71 @@ def run_stream(table: Table, verb: Verb, binary: str, argv: list[str], job: Job,
         if exit_code != 0:
             return {**_failure(table, stderr, exit_code), "lines": lines, "stopped": False, **saved}
         return {"ok": True, "lines": lines, "stopped": False, **saved}
+
+
+def run_login(verb: Verb, binary: str, argv: list[str], job: Job, on_waiting) -> dict:
+    """Run a login that insists on a terminal, and give it the secret when the person has it.
+
+    A tool's terminal output can echo the secret back, in pieces. So everything it prints is read
+    and thrown away, unlooked at, and the result comes only from its exit code. The secret goes
+    to the terminal and nowhere else: not an argument, a log, a snapshot or a message.
+    """
+    job.secrets = queue.Queue(maxsize=1)
+    master, slave = pty.openpty()
+    try:
+        attrs = termios.tcgetattr(slave)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, attrs)
+        # Its own session, with this terminal as its controlling one, as a real terminal would be.
+        proc = job.spawn([binary, *argv], slave, slave, stdin=slave,
+                         preexec_fn=lambda: fcntl.ioctl(slave, termios.TIOCSCTTY, 0))
+    except BaseException:
+        os.close(master)
+        os.close(slave)
+        raise
+    os.close(slave)
+    on_waiting()
+    deadline = time.monotonic() + verb.timeout
+    timed_out = sent = False
+    try:
+        while True:
+            if not sent:
+                try:
+                    secret = job.secrets.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    os.write(master, secret.encode() + b"\n")
+                    del secret
+                    sent = True
+            if time.monotonic() > deadline:
+                timed_out = True
+                job.stop()
+                break
+            ready, _, _ = select.select([master], [], [], LOGIN_POLL_SECONDS)
+            if ready:
+                try:
+                    if not os.read(master, 4096):  # Thrown away on purpose.
+                        break
+                except OSError:  # The tool closed its end.
+                    break
+    finally:
+        job.secrets = None
+        os.close(master)
+    try:
+        exit_code = proc.wait(LOGIN_EXIT_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        job.stop()
+        exit_code = proc.wait()
+    if job.stopped and not timed_out:
+        return {"ok": False, "stopped": True, "error": "stopped", "code": "stopped", "exit": exit_code}
+    if timed_out:
+        return {"ok": False, "error": "The login timed out. Press LOGIN to start again.", "code": "timeout", "exit": exit_code}
+    if exit_code == 0 and sent:
+        return {"ok": True, "exit": 0}
+    if not sent:
+        return {"ok": False, "error": "flowctl stopped before it had a token.", "code": "login_failed", "exit": exit_code}
+    return {"ok": False, "error": LOGIN_REFUSED, "code": "login_failed", "exit": exit_code}
 
 
 def tool_version(table: Table, binary: str) -> str | None:

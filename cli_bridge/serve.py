@@ -1,16 +1,21 @@
 """The app protocol over JSON Lines on stdin/stdout, for any tool's table. See the README."""
 
 import json
+import queue
+import re
 import sys
 import threading
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from .run import Job, default_snapshot_root, run_once, run_stream, tool_version
+from .run import Job, default_snapshot_root, run_login, run_once, run_stream, tool_version
 from .table import BadRequest, Table, build_argv
 
 PROTOCOL_VERSION = 1
-RESERVED = ("hello", "shutdown", "stop")
+RESERVED = ("hello", "shutdown", "stop", "secret")
+MAX_SECRET_LENGTH = 16_384
+# A token has no spaces or line breaks, so it can't add anything to what the terminal receives.
+SECRET = re.compile(r"[\x21-\x7e]+")
 SHUTDOWN_WAIT_SECONDS = 8.0
 
 
@@ -77,6 +82,8 @@ class Server:
             return False
         elif kind == "stop":
             self.stop(rid, request)
+        elif kind == "secret":
+            self.deliver_secret(rid, request)
         elif kind in self.table.verbs:
             self.start(rid, kind, request)
         else:
@@ -93,6 +100,25 @@ class Server:
         if entry:
             entry[0].stop()
         # Already finished is fine: its result is on the way or already sent.
+        self.send({"id": rid, "type": "ok"})
+
+    def deliver_secret(self, rid: str, request: dict) -> None:
+        """Hand a waiting login its secret. Nothing here repeats what it was given."""
+        target, secret = request.get("request"), request.get("secret")
+        if not isinstance(secret, str) or not secret or len(secret) > MAX_SECRET_LENGTH or not SECRET.fullmatch(secret):
+            self.error(rid, "That doesn't look like a token: it should be one line with no spaces.", "bad_secret")
+            return
+        with self._jobs_lock:
+            entry = self._jobs.get(target) if isinstance(target, str) else None
+        waiting = entry[0].secrets if entry else None
+        if waiting is None:
+            self.error(rid, "No login is waiting for a token.", "not_waiting")
+            return
+        try:
+            waiting.put_nowait(secret)
+        except queue.Full:
+            self.error(rid, "This login already has its token.", "not_waiting")
+            return
         self.send({"id": rid, "type": "ok"})
 
     def start(self, rid: str, kind: str, request: dict) -> None:
@@ -119,7 +145,9 @@ class Server:
 
     def _run(self, rid, verb, binary, argv, job) -> None:
         try:
-            if verb.mode == "stream":
+            if verb.mode == "login":
+                result = run_login(verb, binary, argv, job, lambda: self.send({"id": rid, "type": "event", "event": "waiting"}))
+            elif verb.mode == "stream":
                 def on_line(fields):
                     self.send({"id": rid, "type": "event", "event": "line", **fields})
                 result = run_stream(self.table, verb, binary, argv, job, on_line, self.snapshot_root)

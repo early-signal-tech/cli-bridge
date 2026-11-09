@@ -15,6 +15,9 @@ from cli_bridge.serve import Server, tool_report
 from cli_bridge.table import BadRequest, SnapshotRule, build_argv, load_table
 from cli_bridge.tools import flowctl
 
+# Longer than any fragment check below, and nothing like a real token.
+FAKE_TOKEN = "zqx7.vkj2-pwm9qlt4-hdn6rcb3-yfg8swa5-jzk1xeu0.mnb4vcz7"
+
 FAKE_TOOL = r"""#!/usr/bin/env python3
 import json, os, signal, sys, time
 args = sys.argv[1:]
@@ -40,6 +43,20 @@ elif cmd == "sensitive":
     if "--follow" in args:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         time.sleep(30)
+elif cmd == "login":
+    with open(os.environ["FAKE_CALLS"], "a") as f:
+        f.write(json.dumps({"tty": sys.stdin.isatty()}) + "\n")
+    if "--no-prompt" in args: sys.exit(4)
+    prompt = open("/dev/tty", "w")  # Fails without a controlling terminal, as a real prompt would.
+    prompt.write("Paste your token: "); prompt.flush()
+    token = open("/dev/tty").readline().strip()
+    # Repeat it in pieces, the way flowctl's prompt redraws do.
+    for n in range(0, len(token), 7):
+        print("\x1b[2K" + token[:n + 7], flush=True)
+        sys.stderr.write(token[n:n + 7] + "\n")
+    if token != os.environ["FAKE_GOOD_TOKEN"]:
+        sys.stderr.write("Error: JWT token missing payload: " + token + "\n"); sys.exit(1)
+    with open(os.environ["FAKE_SAVED"], "w") as f: f.write("saved")
 elif cmd == "slow":
     time.sleep(30)
 elif cmd == "follow":
@@ -93,6 +110,9 @@ TABLE = {
         "trimmed_many": {"argv": ["many"], "mode": "once", "snapshot": {"keep": ["n"]}},
         "trimmed_follow": {"argv": ["sensitive", "--follow"], "mode": "stream", "snapshot": RULE},
         "quiet_follow": {"argv": ["empty"], "mode": "stream", "snapshot": RULE},
+        "log_in": {"argv": ["login"], "mode": "login", "snapshot": False},
+        "log_in_breaks": {"argv": ["login", "--no-prompt"], "mode": "login", "snapshot": False},
+        "log_in_quick": {"argv": ["slow"], "mode": "login", "snapshot": False, "timeout": 0.3},
         "private": {"argv": ["rows"], "mode": "once", "snapshot": False},
         "follow": {"argv": ["follow"], "mode": "stream", "snapshot": False},
         "follow_ends": {"argv": ["follow", "--then-exit"], "mode": "stream", "snapshot": False},
@@ -155,6 +175,8 @@ def env(tmp_path, monkeypatch):
     lines = tmp_path / "lines.jsonl"
     lines.write_text("\n".join(SENSITIVE_LINES) + "\n")
     monkeypatch.setenv("FAKE_LINES", str(lines))
+    monkeypatch.setenv("FAKE_GOOD_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("FAKE_SAVED", str(tmp_path / "tool-saved-it"))
     path = tmp_path / "table.json"
     path.write_text(json.dumps(TABLE))
     return {"table": load_table(path), "snapshots": tmp_path / "Snapshots", "calls": calls, "tool": tool}
@@ -330,6 +352,125 @@ def test_a_running_id_cant_be_reused(client):
     client.until("r", "result")
 
 
+# login
+
+
+def fragments(token, size=6):
+    return {token[i:i + size] for i in range(len(token) - size + 1)}
+
+
+def everything_sent(client):
+    sent = []
+    while not client.messages.empty():
+        sent.append(json.dumps(client.messages.get_nowait()))
+    return "\n".join(sent)
+
+
+def start_login(client, rid="l", verb="log_in", profile="me"):
+    client.send(id=rid, type=verb, profile=profile)
+    client.until(rid, "accepted")
+    assert client.until(rid, "event")["event"] == "waiting"
+
+
+def test_a_login_gets_the_token_at_a_terminal_and_only_reports_how_it_ended(env, client):
+    start_login(client)
+    client.send(id="s", type="secret", request="l", secret=FAKE_TOKEN)
+    client.until("s", "ok")
+    assert client.until("l", "result")["result"] == {"ok": True, "exit": 0}
+    assert (env["tool"].parent / "tool-saved-it").exists()
+    assert {"tty": True} in calls(env)
+    assert ["-P", "me", "login"] in calls(env)  # the token isn't in its arguments
+
+
+@pytest.mark.parametrize("token", [FAKE_TOKEN, "wrong." + FAKE_TOKEN[::-1]])
+def test_no_piece_of_a_token_reaches_anything_saved_or_sent(env, tmp_path, capfd, token):
+    client = Client(env["table"], env["snapshots"])
+    start_login(client)
+    client.send(id="s", type="secret", request="l", secret=token)
+    client.until("s", "ok")
+    result = client.until("l", "result")["result"]
+    assert result["ok"] is (token == FAKE_TOKEN)
+    client.close()
+
+    sent = json.dumps(result) + everything_sent(client)
+    out, err = capfd.readouterr()
+    saved = "".join(p.read_text(errors="replace") for p in tmp_path.rglob("*")
+                    if p.is_file() and p.name not in ("fake-tool", "table.json"))
+    assert not env["snapshots"].exists()
+    leaks = [(piece, where) for piece in fragments(token)
+             for where, text in (("sent", sent), ("stdout", out), ("stderr", err), ("saved", saved)) if piece in text]
+    assert leaks == []
+
+
+def test_a_refused_token_is_a_plain_failure_and_saves_nothing(env, client):
+    start_login(client)
+    client.send(id="s", type="secret", request="l", secret="not-the-token")
+    client.until("s", "ok")
+    r = client.until("l", "result")["result"]
+    assert not r["ok"] and r["code"] == "login_failed" and r["exit"] == 1
+    assert "JWT" not in r["error"] and "not-the-token" not in r["error"]
+    assert not (env["tool"].parent / "tool-saved-it").exists()
+
+
+@pytest.mark.parametrize("secret", ["two words", "line\nbreak", "tab\there", "", 7, None, ["x"], "x" * 20_000, "ünicode"])
+def test_a_bad_secret_is_refused_without_repeating_it_and_the_login_keeps_waiting(env, client, secret):
+    start_login(client)
+    client.send(id="s", type="secret", request="l", secret=secret)
+    m = client.until("s", "error")
+    assert m["code"] == "bad_secret"
+    if isinstance(secret, str) and secret:
+        assert secret not in json.dumps(m)
+    client.send(id="g", type="secret", request="l", secret=FAKE_TOKEN)
+    client.until("g", "ok")
+    assert client.until("l", "result")["result"]["ok"]
+
+
+def test_a_secret_needs_a_login_that_is_waiting(client):
+    client.send(id="s", type="secret", request="nobody", secret=FAKE_TOKEN)
+    assert client.until("s", "error")["code"] == "not_waiting"
+    client.send(id="r", type="slow")
+    client.until("r", "accepted")
+    client.send(id="t", type="secret", request="r", secret=FAKE_TOKEN)
+    m = client.until("t", "error")
+    assert m["code"] == "not_waiting" and FAKE_TOKEN not in json.dumps(m)
+    client.send(id="x", type="stop", request="r")
+    client.until("r", "result")
+
+
+def test_stop_cancels_a_login_and_nothing_is_saved(env, client):
+    start_login(client)
+    client.send(id="x", type="stop", request="l")
+    r = client.until("l", "result")["result"]
+    assert r["stopped"] and not r["ok"]
+    assert not (env["tool"].parent / "tool-saved-it").exists()
+
+
+def test_a_login_that_breaks_before_the_token_says_so(client):
+    r = client.result(id="l", type="log_in_breaks")
+    assert not r["ok"] and r["code"] == "login_failed" and "before it had a token" in r["error"]
+
+
+def test_a_login_nobody_finishes_times_out(client):
+    r = client.result(id="l", type="log_in_quick")
+    assert not r["ok"] and r["code"] == "timeout"
+
+
+def test_stopping_the_engine_ends_a_waiting_login(env):
+    c = Client(env["table"], env["snapshots"])
+    start_login(c)
+    procs = running_children(c.server)
+    c.requests.close()
+    c.thread.join(10)
+    assert not c.thread.is_alive() and procs[0].poll() is not None
+
+
+def test_a_login_cant_be_saved(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({**TABLE, "verbs": {"v": {"argv": ["v"], "mode": "login", "snapshot": {"keep": ["a"]}}}}))
+    with pytest.raises(ValueError, match="never saved"):
+        load_table(path)
+
+
 # stream
 
 
@@ -498,20 +639,23 @@ def test_garbage_and_missing_ids_get_errors(client):
 # flowctl's table
 
 
-def test_flowctl_table_is_read_only_for_now():
-    """This PR's scope. Login, drafts and publish arrive in their own PRs and change this test on purpose."""
+def test_flowctl_table_only_reads_and_logs_in_for_now():
+    """This PR's scope. Drafts and publish arrive in their own PRs and change this test on purpose."""
     t = flowctl.table()
     assert set(t.verbs) == {"catalog_list", "catalog_status", "catalog_history", "raw_stats", "raw_list_shards",
-                            "logs_read", "logs_follow"}
+                            "logs_read", "logs_follow", "auth_login"}
     words = {word for verb in t.verbs.values() for word in verb.argv}
     words |= {a.flag for verb in t.verbs.values() for a in verb.args}
-    for banned in ("publish", "delete", "draft", "auth", "discover", "preview", "update", "rpc", "--models",
+    for banned in ("publish", "delete", "draft", "token", "--token", "discover", "preview", "update", "rpc", "--models",
                    "--auto-approve", "--dangerous-auto-approve"):
         assert banned not in words
+    assert [name for name, verb in t.verbs.items() if "auth" in verb.argv] == ["auth_login"]
+    login = t.verbs["auth_login"]
+    assert login.argv == ("auth", "login") and login.mode == "login" and login.snapshot is None and not login.args
 
 
 def test_flowctl_only_saves_stats_raw():
-    assert [name for name, verb in flowctl.table().verbs.items() if verb.snapshot.raw] == ["raw_stats"]
+    assert [name for name, verb in flowctl.table().verbs.items() if verb.snapshot and verb.snapshot.raw] == ["raw_stats"]
 
 
 def test_flowctl_logs_never_save_a_failing_document():
