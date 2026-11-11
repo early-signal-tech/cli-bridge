@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ...run import Job, private_folder
 from ...table import BadRequest, Table, Verb
-from .discover import MAX_INPUT_BYTES, _error_text, _forms, _wait
+from .discover import MAX_INPUT_BYTES, _error_text, _forms, _wait, secret_in
 
 DRAFT_ID = re.compile(r"[0-9a-f]{2}(:[0-9a-f]{2}){7}|[0-9a-f]{16}")
 STEP_TIMEOUT_SECONDS = 120.0
@@ -66,6 +66,21 @@ def _step(job: Job, binary: str, profile: list[str], args: list[str], folder: Pa
     with open(folder / "out", "wb") as out, open(folder / "err", "wb") as err:
         code = _wait(job, job.spawn([binary, *profile, *args], out, err, cwd=folder), timeout)
     return code, (folder / "out").read_bytes() + b"\n" + (folder / "err").read_bytes()
+
+
+def _text_leaks(text: str, secrets: list[str]) -> bool:
+    return any(form in text for secret in secrets for form in _forms(secret))
+
+
+def _spec_leaks(spec, secrets: list[str]) -> bool:
+    """A stored spec should be an object. One that comes back as text is read as JSON, and if it
+    can't be, it's refused if a secret's text is in it at all."""
+    if isinstance(spec, str):
+        try:
+            spec = json.loads(spec)
+        except json.JSONDecodeError:
+            return _text_leaks(spec, secrets)
+    return secret_in(spec, secrets)
 
 
 def _profile(verb: Verb, argv: list[str]) -> list[str]:
@@ -139,13 +154,17 @@ def run_author(table: Table, verb: Verb, binary: str, argv: list[str], job: Job,
         stored = printed.decode("utf-8", "replace")
         if code != 0:
             return give_up({"ok": False, "error": "flowctl drafted the specs but couldn't read them back to check them.", "code": "tool_error", "exit": code})
-        if any(form in stored for secret in secrets for form in _forms(secret)):
+        try:
+            specs = json.JSONDecoder().raw_decode(stored[stored.index("["):])[0]
+        except ValueError:
+            specs = None
+        # Values only, as for discover. What can't be read is refused if a secret's text is in it at all.
+        leaked = (any(_spec_leaks(s.get("spec") if isinstance(s, dict) else s, secrets) for s in specs) if isinstance(specs, list)
+                  else _text_leaks(stored, secrets))
+        if leaked:
             return give_up({"ok": False, "code": "secret_left", "exit": 0,
                             "error": "Estuary kept a secret unencrypted, so the draft was deleted. Please check your flowctl version."})
-    try:
-        specs = json.JSONDecoder().raw_decode(stored[stored.index("["):])[0]
-    except ValueError:
-        specs = []
+    specs = specs if isinstance(specs, list) else []
     return {"ok": True, "draft_id": draft_id,
             "specs": [{"catalog_name": s.get("catalog_name"), "spec_type": s.get("spec_type")} for s in specs if isinstance(s, dict)]}
 
