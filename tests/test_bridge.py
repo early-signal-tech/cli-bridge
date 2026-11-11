@@ -1017,8 +1017,9 @@ def test_flowctl_discover_is_wired_up_and_saves_nothing():
         build_argv(t, t.verbs["discover"], {"data_plane": "elsewhere/x"})
 
 
-@pytest.mark.parametrize("name,ok", [("source-postgres", True), ("materialize-iceberg", True), ("source-http-ingest", False),
-                                     ("source-postgres&x=1", False), ("materialize-postgres,y", False)])
+@pytest.mark.parametrize("name,ok", [("source-postgres", True), ("materialize-iceberg", True), ("materialize-s3-parquet", True),
+                                     ("materialize-postgres", False), ("source-http-ingest", False),
+                                     ("source-postgres&x=1", False), ("materialize-s3-parquet,y", False)])
 def test_flowctl_connector_schema_only_asks_about_panel_connectors(name, ok):
     t = flowctl.table()
     verb = t.verbs["connector_schema"]
