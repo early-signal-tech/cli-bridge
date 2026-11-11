@@ -22,7 +22,7 @@ from cli_bridge.tools.flowctl import drafts as flowctl_drafts
 FAKE_TOKEN = "zqx7.vkj2-pwm9qlt4-hdn6rcb3-yfg8swa5-jzk1xeu0.mnb4vcz7"
 
 FAKE_TOOL = r"""#!/usr/bin/env python3
-import json, os, signal, sys, time
+import json, os, re, signal, sys, time
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALLS"], "a") as f:
     f.write(json.dumps(args) + "\n")
@@ -92,7 +92,9 @@ elif cmd == "draft":
             json.dump(state, open(os.environ["FAKE_DRAFTS"], "w"))
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)
         if "keep-plain" not in how:
-            how = how.replace(os.environ.get("FAKE_DEST_SECRET", "~"), "ENC[x]")
+            # As Estuary does: the field becomes <name>_sops, holding ciphertext.
+            secret = re.escape(json.dumps(os.environ.get("FAKE_DEST_SECRET", "~")))
+            how = re.sub(r'"(\w+)": ' + secret, r'"\1_sops": "ENC[x]"', how)
         state["drafts"][state["selected"]] = how
     elif sub == "test":
         spec = state["drafts"].get(state["selected"]) or ""
@@ -103,7 +105,7 @@ elif cmd == "raw" and args[1] == "get":
     state = json.load(open(os.environ["FAKE_DRAFTS"]))
     did = [q for q in args if q.startswith("draft_id=eq.")][0].split(".", 1)[1]
     stored = state["drafts"].get(did) or "{}"
-    print(json.dumps([{"catalog_name": n, "spec_type": k[:-1], "spec": stored} for k, v in json.loads(stored).items() for n in v], indent=1))
+    print(json.dumps([{"catalog_name": n, "spec_type": k[:-1], "spec": s} for k, v in json.loads(stored).items() for n, s in v.items()], indent=1))
 elif cmd == "raw" and args[1] == "bundle":
     print(json.dumps(json.load(open("flow.yaml")), indent=2))
 elif cmd == "document":
@@ -571,6 +573,46 @@ def test_hide_takes_out_every_form_of_a_secret():
     secret = "line-one-of-key\nline-two-of-key"
     assert flowctl_discover.hide("x line-two-of-key y", [secret]) == "x [hidden] y"
     assert flowctl_discover.hide(json.dumps(secret), [secret]) == '"[hidden]"'
+
+
+def test_a_password_that_is_a_field_name_isnt_a_leak(env, client):
+    """A real case: the password "password", next to the encrypted field password_sops."""
+    r = client.result(id="d", type="find", input=find_input(password="password"))
+    assert r["ok"], r
+    assert "password_sops" in r["catalog"]["captures"]["acme/pg"]["endpoint"]["connector"]["config"]
+
+
+@pytest.mark.parametrize("value,secrets,expected", [
+    ({"password_sops": "ENC[x]", "sops": {"mac": "m"}}, ["password"], False),
+    ({"config": {"password": "password"}}, ["password"], True),
+    ({"config": {"uri": "postgres://u:hunter22@db/x"}}, ["hunter22"], True),
+    ({"config": {"nested": [{"key": "pw"}]}}, ["pw"], True),
+    ({"schema": {"description": "The password column"}}, ["password"], False),
+    ({"schema": {"default": "password"}}, ["password"], True),
+    ([{"spec": {"endpoint": {"connector": {"config": {"token": "ENC"}}}}}], ["tok"], False),
+    ([{"spec": {"endpoint": {"connector": {"config": {"token": "my-tok-1"}}}}}], ["tok"], True),
+])
+def test_secret_in_checks_values_not_keys(value, secrets, expected):
+    assert flowctl_discover.secret_in(value, secrets) is expected
+
+
+@pytest.mark.parametrize("spec,leaks", [
+    ('{"endpoint": {"connector": {"config": {"token": "ENC"}}}}', False),
+    ('{"endpoint": {"connector": {"config": {"token": "my-tok-1"}}}}', True),
+    ("not json, but my-tok-1 is in it", True),
+    ("not json, and nothing in it", False),
+])
+def test_a_stored_spec_as_text_is_still_checked(spec, leaks):
+    assert flowctl_drafts._spec_leaks(spec, ["my-tok-1"]) is leaks
+
+
+def test_a_draft_secret_that_is_a_field_name_isnt_a_leak(env, monkeypatch, client):
+    monkeypatch.setenv("FAKE_DEST_SECRET", "token")
+    weak = catalog()
+    weak["materializations"]["acme/md"]["endpoint"]["connector"]["config"] = {"token": "token"}
+    r = client.result(id="a", type="draft_author", input={"catalog": weak, "secret_paths": SECRET_PATH, "replace": None})
+    assert r["ok"], r
+    assert "token_sops" in json.dumps(drafts(env))
 
 
 def test_secret_paths_reach_nested_fields_and_skip_what_isnt_there():

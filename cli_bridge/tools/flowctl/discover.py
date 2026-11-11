@@ -62,6 +62,23 @@ def _forms(secret: str) -> list[str]:
     return list({secret, json.dumps(secret)[1:-1]} | set(line for line in secret.splitlines() if len(line) > 3))
 
 
+def secret_in(value, secrets: list[str], in_config: bool = False) -> bool:
+    """Whether a secret is still in this JSON value, as plain text.
+
+    Only values are checked, never keys: a password of "password" isn't a leak because the
+    encrypted field is called "password_sops". Inside a connector's config, where secrets live,
+    any value that contains one counts, such as a connection URI. Elsewhere (schemas, resources),
+    only a value that is the secret, since a common word could be in a description.
+    """
+    if isinstance(value, dict):
+        return any(secret_in(v, secrets, in_config or k == "config") for k, v in value.items())
+    if isinstance(value, list):
+        return any(secret_in(v, secrets, in_config) for v in value)
+    if isinstance(value, str):
+        return any(value == s or (in_config and s in value) for s in secrets)
+    return False
+
+
 def hide(text: str, secrets: list[str]) -> str:
     for secret in secrets:
         for form in sorted(_forms(secret), key=len, reverse=True):
@@ -117,16 +134,17 @@ def run(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, checke
     # Only the bundle comes back, so it's the one thing that has to be clean.
     refused = {"ok": False, "code": "secret_left", "exit": 0,
                "error": "flowctl didn't encrypt the secrets as expected, so nothing was kept. Please check your flowctl version."}
-    if any(form in text for secret in secrets for form in _forms(secret)):
-        return refused
     try:
         catalog = json.loads(text)
         capture = catalog["captures"][checked["name"]]
         config = capture["endpoint"]["connector"]["config"]
         bindings = capture["bindings"]
     except (json.JSONDecodeError, KeyError, TypeError):
+        # Unreadable, so it can't be checked: refuse it if a secret's text is anywhere in it.
+        if any(form in text for secret in secrets for form in _forms(secret)):
+            return refused
         return {"ok": False, "error": "flowctl found the tables but couldn't read back what it found.", "code": "tool_error", "exit": 0}
-    if secrets and not (isinstance(config, dict) and "sops" in config):
+    if secret_in(catalog, secrets) or (secrets and not (isinstance(config, dict) and "sops" in config)):
         return refused
     return {"ok": True, "catalog": catalog, "bindings": [
         {"target": b.get("target"), "resource": b.get("resource")} for b in bindings if isinstance(b, dict)
