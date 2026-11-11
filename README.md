@@ -81,6 +81,20 @@ text stays in the file. So:
   `secret_left` and nothing else.
 - Nothing is snapshotted, and an unexpected failure is reported with no detail.
 
+## Drafts
+
+`draft_author`, `draft_test` and `draft_delete` work on ES-1's own draft, by ID. flowctl keeps one
+selected draft per profile, and you might be using flowctl at the same time, so each step selects
+ES-1's draft first.
+
+`draft_author` makes a new draft holding the catalog it's given, deleting the one it `replace`s,
+so nothing stale stays in it. A destination's secrets are in that catalog as plain text until
+Estuary encrypts them on authoring, so it's written in a private folder like discover's. The
+stored draft is then read back, and if any secret named in `secret_paths` (lists of keys into the
+catalog) is still in it, the draft is deleted and the result is `secret_left`. A step that fails
+or is stopped part way deletes the draft it made. A catalog that deletes or resets a spec is
+refused. Publishing isn't here.
+
 ## Logging in
 
 `flowctl auth login` opens its token page and waits for a token at a terminal. So a `login`
