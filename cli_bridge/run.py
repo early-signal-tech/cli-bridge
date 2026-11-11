@@ -7,6 +7,7 @@ import pty
 import queue
 import re
 import select
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ import termios
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +24,7 @@ from .table import SnapshotRule, Table, Verb
 KILL_AFTER_SECONDS = 5.0
 MAX_ERROR_CHARS = 2000
 MAX_SNAPSHOT_TEXT = 200
+STALE_WORK_SECONDS = 3600.0
 LOGIN_POLL_SECONDS = 0.1
 LOGIN_EXIT_WAIT_SECONDS = 5.0
 LOGIN_REFUSED = "That token wasn't accepted, so nothing was saved. Copy a new one from the token page and try again."
@@ -30,6 +33,37 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 def default_snapshot_root() -> Path:
     return Path.home() / "Library" / "Application Support" / "Duck Harness" / "Snapshots"
+
+
+def default_work_root() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Duck Harness" / "Work"
+
+
+def sweep_work(root: Path, device: str, older_than: float = STALE_WORK_SECONDS) -> None:
+    """Delete what a crashed run left behind. A run that's still going is younger than this."""
+    folder = root / device
+    if not folder.is_dir():
+        return
+    for path in folder.iterdir():
+        try:
+            if time.time() - path.stat().st_mtime > older_than:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+@contextmanager
+def private_folder(root: Path, device: str):
+    """A folder only this user can read, deleted however the block ends."""
+    parent = root / device
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(parent, 0o700)
+    sweep_work(root, device)
+    folder = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+    try:
+        yield folder
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def summarize_stderr(table: Table, raw: bytes) -> str:
@@ -176,8 +210,8 @@ class Job:
         self.stopped = False
         self.secrets: queue.Queue | None = None  # A login that's waiting for its secret.
 
-    def spawn(self, argv: list[str], stdout, stderr, stdin=subprocess.DEVNULL, preexec_fn=None) -> subprocess.Popen:
-        proc = subprocess.Popen(argv, stdin=stdin, stdout=stdout, stderr=stderr, shell=False, preexec_fn=preexec_fn,
+    def spawn(self, argv: list[str], stdout, stderr, stdin=subprocess.DEVNULL, preexec_fn=None, cwd=None) -> subprocess.Popen:
+        proc = subprocess.Popen(argv, stdin=stdin, stdout=stdout, stderr=stderr, shell=False, preexec_fn=preexec_fn, cwd=cwd,
                                 start_new_session=True, env={**os.environ, "NO_COLOR": "1"})
         with self._lock:
             self._proc = proc
@@ -240,19 +274,32 @@ def run_once(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, s
         trimmed = TrimmedSnapshot(rule, snapshot_root, table.device, verb.name) if rule and not rule.raw else None
         rows: deque = deque(maxlen=table.max_rows)
         count = bad_lines = 0
-        with open(tmp_path, "rb") as lines:
-            for line in lines:
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    bad_lines += 1  # Never saved by a trimmed snapshot: there's no telling what it holds.
-                    continue
-                rows.append(row)
-                count += 1
-                if trimmed:
-                    trimmed.add(row)
+        def add(row) -> None:
+            nonlocal count
+            rows.append(row)
+            count += 1
+            if trimmed:
+                trimmed.add(row)
+
+        if verb.output == "document":
+            try:
+                document = json.loads(Path(tmp_path).read_bytes() or b"[]")
+            except json.JSONDecodeError:
+                bad_lines = 1
+            else:
+                for row in document if isinstance(document, list) else [document]:
+                    add(row)
+        else:
+            with open(tmp_path, "rb") as lines:
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        bad_lines += 1  # Never saved by a trimmed snapshot: there's no telling what it holds.
+                        continue
+                    add(row)
 
         result = {"ok": True, "rows": list(rows), "count": count, "truncated": count > len(rows),
                   "bad_lines": bad_lines, "snapshot": None}

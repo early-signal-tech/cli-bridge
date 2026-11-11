@@ -11,7 +11,8 @@ MAX_VALUE_LENGTH = 512
 MAX_VALUES = 100
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_ROWS = 20_000
-MODES = ("once", "stream", "login")
+MODES = ("once", "stream", "login", "handler")
+OUTPUTS = ("lines", "document")
 
 
 class BadRequest(Exception):
@@ -27,6 +28,7 @@ class Arg:
     many: bool = False
     required: bool = False
     default: str | None = None
+    format: str | None = None  # the checked value goes into this, at {}
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,7 @@ class Verb:
     args: tuple[Arg, ...]
     snapshot: SnapshotRule | None  # None: never saved
     timeout: float
+    output: str = "lines"  # or "document": stdout is one JSON value, and a list's items are the rows
 
     def describe(self) -> dict:
         """What hello tells the face about this verb."""
@@ -108,8 +111,8 @@ def _load_snapshot_rule(verb: str, spec: dict) -> SnapshotRule | None:
     rule = spec["snapshot"]
     if rule is False:
         return None
-    if spec["mode"] == "login":
-        raise ValueError(f"verb {verb}: a login is never saved, so its snapshot has to be false")
+    if spec["mode"] in ("login", "handler"):
+        raise ValueError(f"verb {verb}: this holds secrets and is never saved, so its snapshot has to be false")
     if not isinstance(rule, dict) or set(rule) - {"raw", "keep", "first_line", "numbers"}:
         raise ValueError(f"verb {verb}: a snapshot rule is false, or an object of raw, keep, first_line, numbers")
     if rule.get("raw") is True:
@@ -138,9 +141,12 @@ def load_table(path: str | Path) -> Table:
             if default is not None and not types[a["type"]].fullmatch(default):
                 raise ValueError(f"verb {name}: default for {arg_name} doesn't match its type")
             args.append(Arg(arg_name, a["type"], types[a["type"]], a.get("flag"), a.get("many", False),
-                            a.get("required", False), default))
+                            a.get("required", False), default, a.get("format")))
+        output = spec.get("output", "lines")
+        if output not in OUTPUTS:
+            raise ValueError(f"verb {name}: unknown output {output!r}")
         verbs[name] = Verb(name, tuple(spec["argv"]), spec["mode"], tuple(args), _load_snapshot_rule(name, spec),
-                           float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS)))
+                           float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS)), output)
     profile_type = raw.get("profile_type")
     noise = raw.get("stderr_noise")
     return Table(
@@ -207,5 +213,7 @@ def build_argv(table: Table, verb: Verb, args: dict | None = None, profile: str 
             values = [value]
         for v in values:
             checked = _check_value(arg.name, v, arg.pattern)
+            if arg.format:
+                checked = arg.format.format(checked)
             argv += [arg.flag, checked] if arg.flag else [checked]
     return argv
