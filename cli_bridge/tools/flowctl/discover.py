@@ -4,7 +4,9 @@ flowctl only reads a spec from a file, so the connector's config, passwords incl
 written down for as long as discover runs. On success flowctl replaces the secrets with encrypted
 ones. On failure the plain text stays in that file. So:
 
-- It runs in a private folder that's always deleted, however the run ends. A crash can't delete
+- It runs in a private folder that's always deleted, however the run ends.
+- flowctl discovers into a draft of its own on Estuary. A stopped run kills it before it can
+  delete that, so the engine does. A crash can't delete
   anything, so what one leaves behind is swept by the next engine and the next discover.
 - Nothing it prints is passed along without the secrets taken out.
 - What comes back is checked. A secret in the result, or a result that isn't encrypted, is
@@ -14,6 +16,7 @@ ones. On failure the plain text stays in that file. So:
 import json
 import re
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ...run import ANSI, Job, private_folder, summarize_stderr
@@ -102,8 +105,64 @@ def _wait(job: Job, proc: subprocess.Popen, timeout: float) -> int | None:
         return None
 
 
+CLEANUP_TIMEOUT_SECONDS = 60.0
+
+
+def _flowctl(binary: str, profile: list[str], args: list[str], folder: Path) -> tuple[int | None, str]:
+    """A cleanup step, on a job of its own: a stop has already stopped the run's."""
+    cleanup = Job()
+    with open(folder / "cleanup", "wb") as out:
+        code = _wait(cleanup, cleanup.spawn([binary, *profile, *args], out, subprocess.DEVNULL, cwd=folder), CLEANUP_TIMEOUT_SECONDS)
+    return code, (folder / "cleanup").read_text(encoding="utf-8", errors="replace")
+
+
+def leftover_drafts(listed: str, specs_of, name: str, started: datetime) -> list[str]:
+    """The drafts a stopped discover left: made by flowctl since it started, and either empty or
+    holding this capture. Anything else is someone else's, and is kept."""
+    found = []
+    for line in listed.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+            created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+        except (ValueError, KeyError, TypeError):
+            continue
+        if row.get("detail") != "Created by flowctl" or created < started:
+            continue
+        names = specs_of(row["id"])
+        if names is not None and (not names or name in names):
+            found.append(row["id"])
+    return found
+
+
+def _clean_up(binary: str, profile: list[str], folder: Path, name: str, started: datetime) -> None:
+    """flowctl discovers into a draft of its own and deletes it at the end. A stop kills it first,
+    leaving that draft on Estuary, so it's deleted here."""
+    code, listed = _flowctl(binary, profile, ["draft", "list", "-o", "json"], folder)
+    if code != 0:
+        return
+
+    def specs_of(draft_id: str) -> list[str] | None:
+        code, text = _flowctl(binary, profile, ["raw", "get", "--table", "draft_specs", "--query", "select=catalog_name",
+                                                "--query", f"draft_id=eq.{draft_id}"], folder)
+        if code != 0:
+            return None
+        try:
+            rows = json.JSONDecoder().raw_decode(text[text.index("["):])[0]
+        except ValueError:
+            return None
+        return [r.get("catalog_name") for r in rows if isinstance(r, dict)]
+
+    for draft_id in leftover_drafts(listed, specs_of, name, started):
+        if _flowctl(binary, profile, ["draft", "select", "--id", draft_id], folder)[0] == 0:
+            _flowctl(binary, profile, ["draft", "delete"], folder)
+
+
 def run(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, checked: dict, work_root: Path) -> dict:
     secrets = checked["secrets"]
+    # Estuary's clock decides created_at, so allow for a little drift.
+    started = datetime.now(timezone.utc) - timedelta(seconds=30)
     profile = argv[:argv.index(verb.argv[0])]
     spec = {"captures": {checked["name"]: {
         "endpoint": {"connector": {"image": checked["image"], "config": checked["config"]}},
@@ -115,8 +174,10 @@ def run(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, checke
         with open(folder / "out", "wb") as out, open(folder / "err", "wb") as err:
             code = _wait(job, job.spawn([binary, *argv], out, err, cwd=folder), verb.timeout)
         if job.stopped and code is not None:
+            _clean_up(binary, profile, folder, checked["name"], started)
             return {"ok": False, "stopped": True, "error": "stopped", "code": "stopped", "exit": code}
         if code is None:
+            _clean_up(binary, profile, folder, checked["name"], started)
             return {"ok": False, "error": f"Discover took longer than {verb.timeout:g} seconds.", "code": "timeout", "exit": None}
         if code != 0:
             # The connector's log goes to stdout, and flowctl's own summary to stderr.
