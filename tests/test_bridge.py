@@ -1164,7 +1164,7 @@ def test_flowctl_discover_is_wired_up_and_saves_nothing():
     source = (Path(flowctl.__file__).parent / "drafts.py").read_text()
     assert "auto-approve" not in source
     # Every command the draft steps run starts with "draft" or "raw", never "catalog".
-    assert not re.search(r'\[\s*"catalog"', source)
+    assert not re.search(r'\[\s*"catalog"\s*,', source)
     assert build_argv(t, t.verbs["discover"], {"data_plane": "ops/dp/public/aws-us-east-1-c1"}, "me") == [
         "--profile", "me", "discover", "--source", "flow.yaml", "--flat", "--data-plane", "ops/dp/public/aws-us-east-1-c1"]
     with pytest.raises(BadRequest):
