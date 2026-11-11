@@ -19,7 +19,7 @@
   ],
   "types": {
     "profile": "[A-Za-z0-9_][A-Za-z0-9_-]*",
-    "connector": "source-(postgres|mysql|sqlserver|mongodb|snowflake)|materialize-(motherduck|snowflake|bigquery|postgres|iceberg)",
+    "connector": "source-(postgres|mysql|sqlserver|mongodb|snowflake)|materialize-(motherduck|snowflake|bigquery|s3-parquet|iceberg)",
     "data_plane": "ops/dp/public/[a-z0-9-]+",
     "catalog_name": "(?!.*\\.\\.)[^\\W][\\w.-]*(/[\\w.-]+)+",
     "catalog_prefix": "(?!.*\\.\\.)[^\\W][\\w.-]*(/[\\w.-]+)*/",
