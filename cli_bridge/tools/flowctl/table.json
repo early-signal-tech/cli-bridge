@@ -30,6 +30,7 @@
     "draft_author": {"argv": ["draft", "author"], "mode": "handler", "snapshot": false, "timeout": 300},
     "draft_test": {"argv": ["draft", "test", "-o", "json"], "mode": "handler", "snapshot": false, "timeout": 900, "args": {"data_plane": {"type": "data_plane", "flag": "--init-data-plane"}}},
     "draft_delete": {"argv": ["draft", "delete", "-o", "json"], "mode": "handler", "snapshot": false, "timeout": 120},
+    "draft_publish": {"argv": ["draft", "publish", "-o", "json"], "mode": "handler", "snapshot": false, "timeout": 900, "args": {"data_plane": {"type": "data_plane", "flag": "--init-data-plane"}}},
     "discover": {"argv": ["discover", "--source", "flow.yaml", "--flat"], "mode": "handler", "snapshot": false, "timeout": 300, "args": {"data_plane": {"type": "data_plane", "flag": "--data-plane"}}},
     "auth_login": {"argv": ["auth", "login"], "mode": "login", "snapshot": false, "timeout": 600},
     "catalog_list": {"argv": ["catalog", "list", "--flows", "-o", "json"], "mode": "once", "args": {"prefix": {"type": "catalog_prefix", "flag": "--prefix"}}, "snapshot": {"keep": ["catalogName", "liveSpec.catalogType", "liveSpec.isDisabled", "liveSpec.updatedAt", "liveSpec.readsFrom", "liveSpec.writesTo", "liveSpec.readBy", "liveSpec.writtenBy", "status.type"], "first_line": ["status.summary"]}},

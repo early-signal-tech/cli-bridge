@@ -1,4 +1,4 @@
-"""ES-1's draft steps: author, test and delete, always on ES-1's own draft.
+"""ES-1's draft steps: author, test, delete and publish, always on ES-1's own draft.
 
 flowctl keeps one selected draft per profile, and someone using flowctl at the same time could
 change it. So each step selects ES-1's draft by its ID first, in the same run.
@@ -192,3 +192,62 @@ def run_test(table, verb, binary, argv, job, checked, work_root) -> dict:
 
 def run_delete(table, verb, binary, argv, job, checked, work_root) -> dict:
     return _on_draft(table, verb, binary, argv, job, checked["draft_id"], work_root)
+
+
+def check_publish(payload) -> dict:
+    """The draft, and the names the person was shown and confirmed."""
+    if not isinstance(payload, dict):
+        raise BadRequest('draft_publish needs "input": an object of draft_id and expect')
+    expect = payload.get("expect")
+    if not isinstance(expect, list) or not expect or not all(isinstance(n, str) and n for n in expect):
+        raise BadRequest("expect has to list the catalog names that were confirmed.")
+    return {"draft_id": _draft_id(payload.get("draft_id")), "expect": sorted(set(expect))}
+
+
+def run_publish(table: Table, verb: Verb, binary: str, argv: list[str], job: Job, checked: dict, work_root: Path) -> dict:
+    """Publish ES-1's draft, but only if it holds exactly what was confirmed and deletes nothing.
+
+    flowctl runs the tests again first and publishes only if they pass. On success it deletes
+    the draft; on failure the draft stays, so it can be fixed or discarded.
+    """
+    profile, draft_id = _profile(verb, argv), checked["draft_id"]
+    with private_folder(work_root, table.device) as folder:
+        code, printed = _step(job, binary, profile, ["draft", "select", "--id", draft_id], folder, STEP_TIMEOUT_SECONDS)
+        if ended := _ended(job, code, STEP_TIMEOUT_SECONDS):
+            return ended
+        if code != 0:
+            return {"ok": False, "error": "That draft isn't there any more. Press DRAFT to make a new one.", "code": "no_draft", "exit": code}
+
+        code, printed = _step(job, binary, profile, ["raw", "get", "--table", "draft_specs", "--query", "select=catalog_name,spec",
+                                                     "--query", f"draft_id=eq.{draft_id}"], folder, STEP_TIMEOUT_SECONDS)
+        if ended := _ended(job, code, STEP_TIMEOUT_SECONDS):
+            return ended
+        text = printed.decode("utf-8", "replace")
+        try:
+            rows = json.JSONDecoder().raw_decode(text[text.index("["):])[0]
+        except ValueError:
+            rows = None
+        if code != 0 or not isinstance(rows, list):
+            return {"ok": False, "error": "Couldn't read the draft back to check it, so nothing was published.", "code": "tool_error", "exit": code}
+
+        names = sorted({r.get("catalog_name") for r in rows if isinstance(r, dict)})
+        if names != checked["expect"]:
+            return {"ok": False, "code": "draft_changed", "exit": 0,
+                    "error": "The draft doesn't hold what was confirmed, so nothing was published. Press DRAFT and TEST again."}
+        for row in rows:
+            spec = row.get("spec")
+            if isinstance(spec, str):
+                try:
+                    spec = json.loads(spec)
+                except json.JSONDecodeError:
+                    spec = None
+            if spec is None or (isinstance(spec, dict) and (spec.get("delete") or spec.get("reset"))):
+                return {"ok": False, "code": "refused", "exit": 0,
+                        "error": "The draft deletes or resets a spec, or one can't be read. ES-1 never publishes that."}
+
+        code, printed = _step(job, binary, [], argv, folder, verb.timeout)
+        if ended := _ended(job, code, verb.timeout):
+            return ended
+        if code != 0:
+            return _failed(table, code, printed, [])
+    return {"ok": True, "published": checked["expect"]}

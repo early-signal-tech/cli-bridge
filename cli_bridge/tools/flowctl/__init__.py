@@ -18,6 +18,7 @@ HANDLERS = {
     "draft_author": Handler(drafts.check_author, drafts.run_author),
     "draft_test": Handler(drafts.check_draft, drafts.run_test),
     "draft_delete": Handler(drafts.check_draft, drafts.run_delete),
+    "draft_publish": Handler(drafts.check_publish, drafts.run_publish),
 }
 
 

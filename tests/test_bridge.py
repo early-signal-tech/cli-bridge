@@ -4,6 +4,7 @@ import io
 import json
 import os
 import queue
+import re
 import stat
 import threading
 import time
@@ -107,6 +108,12 @@ elif cmd == "draft":
             secret = re.escape(json.dumps(os.environ.get("FAKE_DEST_SECRET", "~")))
             how = re.sub(r'"(\w+)": ' + secret, r'"\1_sops": "ENC[x]"', how)
         state["drafts"][state["selected"]] = how
+    elif sub == "publish":
+        spec = state["drafts"].get(state["selected"]) or ""
+        with open(os.environ["FAKE_CALLS"], "a") as f: f.write(json.dumps({"published": state["selected"]}) + "\n")
+        if "test-fails" in spec: print("2026 build> ERROR: cannot connect to destination"); sys.stderr.write("Error: test failed\n"); sys.exit(1)
+        state.setdefault("live", []).append(state["selected"])
+        state["drafts"].pop(state["selected"], None); state["selected"] = None
     elif sub == "test":
         spec = state["drafts"].get(state["selected"]) or ""
         with open(os.environ["FAKE_CALLS"], "a") as f: f.write(json.dumps({"tested": state["selected"]}) + "\n")
@@ -196,6 +203,7 @@ TABLE = {
         "draft_author_quick": {"argv": ["draft", "author"], "mode": "handler", "snapshot": False, "timeout": 0.5},
         "draft_test": {"argv": ["draft", "test"], "mode": "handler", "snapshot": False, "timeout": 5},
         "draft_delete": {"argv": ["draft", "delete"], "mode": "handler", "snapshot": False, "timeout": 5},
+        "draft_publish": {"argv": ["draft", "publish"], "mode": "handler", "snapshot": False, "timeout": 5},
         "document": {"argv": ["document"], "mode": "once", "output": "document", "snapshot": {"keep": ["n"]}},
         "formatted": {"argv": ["rows"], "mode": "once", "snapshot": False,
                       "args": {"name": {"type": "word", "flag": "--q", "format": "x=eq.{}"}}},
@@ -233,7 +241,8 @@ class Client:
                                      ("draft_author", flowctl_drafts.check_author, flowctl_drafts.run_author),
                                      ("draft_author_quick", flowctl_drafts.check_author, flowctl_drafts.run_author),
                                      ("draft_test", flowctl_drafts.check_draft, flowctl_drafts.run_test),
-                                     ("draft_delete", flowctl_drafts.check_draft, flowctl_drafts.run_delete))}})
+                                     ("draft_delete", flowctl_drafts.check_draft, flowctl_drafts.run_delete),
+                                     ("draft_publish", flowctl_drafts.check_publish, flowctl_drafts.run_publish))}})
         self.thread = threading.Thread(target=self.server.serve, daemon=True)
         self.thread.start()
 
@@ -771,6 +780,61 @@ def test_a_bad_draft_id_never_runs(env, client, verb, bad):
     assert client.until("x", "error")["code"] == "bad_request" and calls(env) == []
 
 
+EXPECT = ["acme/md", "acme/pg", "acme/pg/t"]
+
+
+def live(env):
+    path = env["tool"].parent / "drafts.json"
+    return json.loads(path.read_text()).get("live", []) if path.exists() else []
+
+
+def test_publish_goes_live_only_with_exactly_what_was_confirmed(env, client):
+    did = author(client)["draft_id"]
+    r = client.result(id="p", type="draft_publish", input={"draft_id": did, "expect": list(reversed(EXPECT))})
+    assert r == {"ok": True, "published": EXPECT}
+    assert live(env) == [did] and did not in drafts(env)
+
+
+@pytest.mark.parametrize("expect", [EXPECT[:2], EXPECT + ["acme/extra"], ["acme/other"]])
+def test_publish_refuses_a_draft_that_isnt_what_was_confirmed(env, client, expect):
+    did = author(client)["draft_id"]
+    r = client.result(id="p", type="draft_publish", input={"draft_id": did, "expect": expect})
+    assert not r["ok"] and r["code"] == "draft_changed"
+    assert live(env) == [] and did in drafts(env)
+    assert {"published": did} not in calls(env)
+
+
+def test_publish_refuses_a_draft_that_deletes_a_spec(env, client):
+    did = author(client)["draft_id"]
+    path = env["tool"].parent / "drafts.json"
+    state = json.loads(path.read_text())
+    stored = json.loads(state["drafts"][did])
+    stored["collections"]["acme/pg/t"]["delete"] = True  # As if someone edited the draft meanwhile.
+    state["drafts"][did] = json.dumps(stored)
+    path.write_text(json.dumps(state))
+    r = client.result(id="p", type="draft_publish", input={"draft_id": did, "expect": EXPECT})
+    assert not r["ok"] and r["code"] == "refused" and live(env) == []
+
+
+def test_a_failed_publish_says_why_and_keeps_the_draft(env, client):
+    did = author(client, "test-fails")["draft_id"]
+    r = client.result(id="p", type="draft_publish", input={"draft_id": did, "expect": EXPECT})
+    assert not r["ok"] and r["error"] == "cannot connect to destination"
+    assert live(env) == [] and did in drafts(env)
+
+
+def test_publishing_a_draft_thats_gone_says_so(env, client):
+    r = client.result(id="p", type="draft_publish", input={"draft_id": "00000000000000ff", "expect": EXPECT})
+    assert not r["ok"] and r["code"] == "no_draft" and live(env) == []
+
+
+@pytest.mark.parametrize("bad", [None, {}, {"draft_id": "00000000000000ff"}, {"draft_id": "00000000000000ff", "expect": []},
+                                 {"draft_id": "00000000000000ff", "expect": "acme/x"}, {"draft_id": "-x", "expect": EXPECT}])
+def test_a_bad_publish_never_runs(env, client, bad):
+    client.send(id="p", type="draft_publish", input=bad)
+    assert client.until("p", "error")["code"] == "bad_request" and calls(env) == []
+
+
 # A document's rows, and an argument's format
 
 
@@ -1074,15 +1138,17 @@ def test_garbage_and_missing_ids_get_errors(client):
 # flowctl's table
 
 
-def test_flowctl_table_never_publishes_for_now():
-    """This PR's scope. Publishing arrives in its own PR and changes this test on purpose."""
+def test_flowctl_only_publishes_through_draft_publish():
+    """Publishing is draft_publish's alone, it never auto-approves, and it never runs catalog publish."""
     t = flowctl.table()
     assert set(t.verbs) == {"catalog_list", "catalog_status", "catalog_history", "raw_stats", "raw_list_shards",
                             "logs_read", "logs_follow", "auth_login", "connector_schema", "discover",
-                            "draft_author", "draft_test", "draft_delete"}
+                            "draft_author", "draft_test", "draft_delete", "draft_publish"}
     words = {word for verb in t.verbs.values() for word in verb.argv}
     words |= {a.flag for verb in t.verbs.values() for a in verb.args}
-    for banned in ("publish", "token", "--token", "preview", "update", "rpc", "--models",
+    publishing = [name for name, verb in t.verbs.items() if "publish" in verb.argv]
+    assert publishing == ["draft_publish"] and t.verbs["draft_publish"].argv == ("draft", "publish", "-o", "json")
+    for banned in ("token", "--token", "preview", "update", "rpc", "--models",
                    "--auto-approve", "--dangerous-auto-approve"):
         assert banned not in words
     assert [name for name, verb in t.verbs.items() if "auth" in verb.argv] == ["auth_login"]
@@ -1093,11 +1159,12 @@ def test_flowctl_table_never_publishes_for_now():
 def test_flowctl_discover_is_wired_up_and_saves_nothing():
     t = flowctl.table()
     assert t.verbs["discover"].mode == "handler" and t.verbs["discover"].snapshot is None
-    assert set(flowctl.HANDLERS) == {"discover", "draft_author", "draft_test", "draft_delete"}
+    assert set(flowctl.HANDLERS) == {"discover", "draft_author", "draft_test", "draft_delete", "draft_publish"}
     assert all(t.verbs[name].mode == "handler" and t.verbs[name].snapshot is None for name in flowctl.HANDLERS)
-    assert "publish" not in json.dumps([v.argv for v in t.verbs.values()])
     source = (Path(flowctl.__file__).parent / "drafts.py").read_text()
-    assert '"publish"' not in source
+    assert "auto-approve" not in source
+    # Every command the draft steps run starts with "draft" or "raw", never "catalog".
+    assert not re.search(r'\[\s*"catalog"\s*,', source)
     assert build_argv(t, t.verbs["discover"], {"data_plane": "ops/dp/public/aws-us-east-1-c1"}, "me") == [
         "--profile", "me", "discover", "--source", "flow.yaml", "--flat", "--data-plane", "ops/dp/public/aws-us-east-1-c1"]
     with pytest.raises(BadRequest):

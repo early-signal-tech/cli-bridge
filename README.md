@@ -83,7 +83,7 @@ text stays in the file. So:
 
 ## Drafts
 
-`draft_author`, `draft_test` and `draft_delete` work on ES-1's own draft, by ID. flowctl keeps one
+`draft_author`, `draft_test`, `draft_delete` and `draft_publish` work on ES-1's own draft, by ID. flowctl keeps one
 selected draft per profile, and you might be using flowctl at the same time, so each step selects
 ES-1's draft first.
 
@@ -93,7 +93,14 @@ Estuary encrypts them on authoring, so it's written in a private folder like dis
 stored draft is then read back, and if any secret named in `secret_paths` (lists of keys into the
 catalog) is still in it, the draft is deleted and the result is `secret_left`. A step that fails
 or is stopped part way deletes the draft it made. A catalog that deletes or resets a spec is
-refused. Publishing isn't here.
+refused.
+
+`draft_publish` is the one command that changes anything live. It takes the draft and the
+catalog names the person confirmed (`expect`), reads the draft back, and publishes only if it
+holds exactly those names and nothing in it deletes or resets a spec. flowctl then tests again
+and publishes only if the tests pass. The engine doesn't ask anyone: the host confirms each
+publish before the request reaches it (Duck Harness's dh-host), so no face can skip that.
+`--auto-approve` and `catalog publish` are never used.
 
 ## Logging in
 
