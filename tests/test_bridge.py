@@ -9,12 +9,14 @@ import threading
 import time
 
 import pytest
+from pathlib import Path
 
 from cli_bridge.run import MAX_SNAPSHOT_TEXT, trim_row
 from cli_bridge.serve import Handler, Server, tool_report
 from cli_bridge.table import BadRequest, SnapshotRule, build_argv, load_table
 from cli_bridge.tools import flowctl
 from cli_bridge.tools.flowctl import discover as flowctl_discover
+from cli_bridge.tools.flowctl import drafts as flowctl_drafts
 
 # Longer than any fragment check below, and nothing like a real token.
 FAKE_TOKEN = "zqx7.vkj2-pwm9qlt4-hdn6rcb3-yfg8swa5-jzk1xeu0.mnb4vcz7"
@@ -68,6 +70,40 @@ elif cmd == "discover":
     capture["endpoint"]["connector"]["config"] = config
     capture["bindings"] = [{"resource": {"namespace": "public", "stream": "orders"}, "target": name + "/public/orders"}]
     json.dump(spec, open("flow.yaml", "w"))
+elif cmd == "draft":
+    state = json.load(open(os.environ["FAKE_DRAFTS"])) if os.path.exists(os.environ["FAKE_DRAFTS"]) else {"drafts": {}, "selected": None}
+    sub = args[1]
+    if sub == "create":
+        state["made"] = state.get("made", 0) + 1
+        did = "%016x" % (state["made"] + 0xabc0)
+        state["drafts"][did] = None; state["selected"] = did
+        print(json.dumps({"id": did, "created_at": "now"}))
+    elif sub == "select":
+        did = args[args.index("--id") + 1]
+        if did not in state["drafts"]: sys.stderr.write("Error: no such draft\n"); sys.exit(1)
+        state["selected"] = did
+    elif sub == "delete":
+        state["drafts"].pop(state["selected"], None); state["selected"] = None
+    elif sub == "author":
+        catalog = json.load(open(args[args.index("--source") + 1]))
+        how = json.dumps(catalog)
+        if "author-fails" in how: sys.stderr.write("Error: bad spec near " + how[:200] + "\n"); sys.exit(1)
+        if "author-hangs" in how:
+            json.dump(state, open(os.environ["FAKE_DRAFTS"], "w"))
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)
+        if "keep-plain" not in how:
+            how = how.replace(os.environ.get("FAKE_DEST_SECRET", "~"), "ENC[x]")
+        state["drafts"][state["selected"]] = how
+    elif sub == "test":
+        spec = state["drafts"].get(state["selected"]) or ""
+        with open(os.environ["FAKE_CALLS"], "a") as f: f.write(json.dumps({"tested": state["selected"]}) + "\n")
+        if "test-fails" in spec: print("2026 build> ERROR: cannot connect to destination"); sys.stderr.write("Error: test failed\n"); sys.exit(1)
+    json.dump(state, open(os.environ["FAKE_DRAFTS"], "w"))
+elif cmd == "raw" and args[1] == "get":
+    state = json.load(open(os.environ["FAKE_DRAFTS"]))
+    did = [q for q in args if q.startswith("draft_id=eq.")][0].split(".", 1)[1]
+    stored = state["drafts"].get(did) or "{}"
+    print(json.dumps([{"catalog_name": n, "spec_type": k[:-1], "spec": stored} for k, v in json.loads(stored).items() for n in v], indent=1))
 elif cmd == "raw" and args[1] == "bundle":
     print(json.dumps(json.load(open("flow.yaml")), indent=2))
 elif cmd == "document":
@@ -143,6 +179,10 @@ TABLE = {
                  "args": {"data_plane": {"type": "word", "flag": "--data-plane"}}},
         "find_quick": {"argv": ["discover", "--source", "flow.yaml"], "mode": "handler", "snapshot": False, "timeout": 0.5},
         "find_nothing": {"argv": ["discover"], "mode": "handler", "snapshot": False},
+        "draft_author": {"argv": ["draft", "author"], "mode": "handler", "snapshot": False, "timeout": 5},
+        "draft_author_quick": {"argv": ["draft", "author"], "mode": "handler", "snapshot": False, "timeout": 0.5},
+        "draft_test": {"argv": ["draft", "test"], "mode": "handler", "snapshot": False, "timeout": 5},
+        "draft_delete": {"argv": ["draft", "delete"], "mode": "handler", "snapshot": False, "timeout": 5},
         "document": {"argv": ["document"], "mode": "once", "output": "document", "snapshot": {"keep": ["n"]}},
         "formatted": {"argv": ["rows"], "mode": "once", "snapshot": False,
                       "args": {"name": {"type": "word", "flag": "--q", "format": "x=eq.{}"}}},
@@ -175,7 +215,12 @@ class Client:
         self.work = snapshots.parent / "Work"
         finder = Handler(flowctl_discover.check, flowctl_discover.run)
         self.server = Server(table, self.stdin, Out(), snapshot_root=snapshots, work_root=self.work,
-                             handlers={"find": finder, "find_quick": finder})
+                             handlers={"find": finder, "find_quick": finder, **{
+                                 name: Handler(check, run) for name, check, run in (
+                                     ("draft_author", flowctl_drafts.check_author, flowctl_drafts.run_author),
+                                     ("draft_author_quick", flowctl_drafts.check_author, flowctl_drafts.run_author),
+                                     ("draft_test", flowctl_drafts.check_draft, flowctl_drafts.run_test),
+                                     ("draft_delete", flowctl_drafts.check_draft, flowctl_drafts.run_delete))}})
         self.thread = threading.Thread(target=self.server.serve, daemon=True)
         self.thread.start()
 
@@ -217,6 +262,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_GOOD_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("FAKE_SAVED", str(tmp_path / "tool-saved-it"))
     monkeypatch.setenv("FAKE_FOLDER", str(tmp_path / "ran-in"))
+    monkeypatch.setenv("FAKE_DRAFTS", str(tmp_path / "drafts.json"))
+    monkeypatch.setenv("FAKE_DEST_SECRET", DEST_SECRET)
     path = tmp_path / "table.json"
     path.write_text(json.dumps(TABLE))
     return {"table": load_table(path), "snapshots": tmp_path / "Snapshots", "calls": calls, "tool": tool}
@@ -532,6 +579,111 @@ def test_secret_paths_reach_nested_fields_and_skip_what_isnt_there():
     assert checked["secrets"] == ["abc"]
 
 
+# drafts
+
+DEST_SECRET = "dest-pw-qz81-made-up"
+
+
+def catalog(flag="ok"):
+    return {"captures": {"acme/pg": {"endpoint": {"connector": {"image": "x", "config": {"password_sops": "ENC"}}}, "bindings": []}},
+            "collections": {"acme/pg/t": {"key": ["/id"]}},
+            "materializations": {"acme/md": {"source": {"capture": "acme/pg"}, "flag": flag,
+                                             "endpoint": {"connector": {"image": "y", "config": {"token": DEST_SECRET}}}, "bindings": []}}}
+
+
+SECRET_PATH = [["materializations", "acme/md", "endpoint", "connector", "config", "token"]]
+
+
+def drafts(env):
+    path = env["tool"].parent / "drafts.json"
+    return json.loads(path.read_text())["drafts"] if path.exists() else {}
+
+
+def author(client, flag="ok", replace=None, verb="draft_author"):
+    return client.result(id="a", type=verb, profile="me", input={"catalog": catalog(flag), "secret_paths": SECRET_PATH, "replace": replace})
+
+
+def test_author_makes_a_draft_with_the_secret_encrypted_and_says_what_is_in_it(env, client):
+    r = author(client)
+    assert r["ok"] and r["draft_id"] in drafts(env)
+    assert sorted(s["catalog_name"] for s in r["specs"]) == ["acme/md", "acme/pg", "acme/pg/t"]
+    assert DEST_SECRET not in json.dumps(drafts(env)) and DEST_SECRET not in json.dumps(r)
+    assert_nothing_left(env, client)
+    assert not any(DEST_SECRET in json.dumps(c) for c in calls(env))
+
+
+def test_author_replaces_the_old_draft_rather_than_adding_to_it(env, client):
+    first = author(client)["draft_id"]
+    second = author(client, replace=first)["draft_id"]
+    assert first != second and list(drafts(env)) == [second]
+
+
+def test_a_secret_left_unencrypted_deletes_the_draft(env, tmp_path, capfd):
+    client = Client(env["table"], env["snapshots"])
+    r = author(client, "keep-plain")
+    client.close()
+    assert not r["ok"] and r["code"] == "secret_left" and drafts(env) == {}
+    out, err = capfd.readouterr()
+    sent = json.dumps(r) + everything_sent(client) + out + err
+    for piece in fragments(DEST_SECRET):
+        assert piece not in sent
+
+
+@pytest.mark.parametrize("flag,code", [("author-fails", "tool_error")])
+def test_a_failed_author_deletes_its_draft_and_hides_the_secret(env, client, flag, code):
+    r = author(client, flag)
+    assert not r["ok"] and r["code"] == code and drafts(env) == {}
+    for piece in fragments(DEST_SECRET):
+        assert piece not in r["error"]
+    assert_nothing_left(env, client)
+
+
+def test_an_author_that_hangs_times_out_and_deletes_its_draft(env, client):
+    r = author(client, "author-hangs", verb="draft_author_quick")
+    assert r["code"] == "timeout" and drafts(env) == {}
+    assert_nothing_left(env, client)
+
+
+def test_test_and_delete_select_es1s_draft_first(env, client):
+    ours = author(client)["draft_id"]
+    other = author(client)["draft_id"]  # As if someone selected another draft meanwhile.
+    assert client.result(id="t", type="draft_test", input={"draft_id": ours})["ok"]
+    assert {"tested": ours} in calls(env)
+    assert client.result(id="d", type="draft_delete", input={"draft_id": ours})["ok"]
+    assert list(drafts(env)) == [other]
+
+
+def test_a_failed_test_says_why(env, client):
+    did = author(client, "test-fails")["draft_id"]
+    r = client.result(id="t", type="draft_test", input={"draft_id": did})
+    assert not r["ok"] and r["error"] == "cannot connect to destination" and did in drafts(env)
+
+
+def test_a_draft_thats_gone_says_so(client):
+    r = client.result(id="t", type="draft_test", input={"draft_id": "00000000000000ff"})
+    assert not r["ok"] and r["code"] == "no_draft"
+
+
+@pytest.mark.parametrize("bad", [
+    None, {}, {"catalog": {}}, {"catalog": {"tests": {}}}, {"catalog": {"captures": []}},
+    {"catalog": {"captures": {"a/b": {"delete": True}}}},
+    {"catalog": {"collections": {"a/b": {"reset": True}}}},
+    {"catalog": catalog(), "secret_paths": "token"},
+    {"catalog": catalog(), "secret_paths": SECRET_PATH, "replace": "--id"},
+])
+def test_a_bad_author_never_runs_and_doesnt_repeat_its_input(env, client, bad):
+    client.send(id="a", type="draft_author", input=bad)
+    m = client.until("a", "error")
+    assert m["code"] == "bad_request" and calls(env) == [] and DEST_SECRET not in json.dumps(m)
+
+
+@pytest.mark.parametrize("verb", ["draft_test", "draft_delete"])
+@pytest.mark.parametrize("bad", [None, {}, {"draft_id": "x; rm"}, {"draft_id": "-a"}, {"draft_id": 7}])
+def test_a_bad_draft_id_never_runs(env, client, verb, bad):
+    client.send(id="x", type=verb, input=bad)
+    assert client.until("x", "error")["code"] == "bad_request" and calls(env) == []
+
+
 # A document's rows, and an argument's format
 
 
@@ -835,14 +987,15 @@ def test_garbage_and_missing_ids_get_errors(client):
 # flowctl's table
 
 
-def test_flowctl_table_only_reads_logs_in_and_discovers_for_now():
-    """This PR's scope. Drafts and publish arrive in their own PRs and change this test on purpose."""
+def test_flowctl_table_never_publishes_for_now():
+    """This PR's scope. Publishing arrives in its own PR and changes this test on purpose."""
     t = flowctl.table()
     assert set(t.verbs) == {"catalog_list", "catalog_status", "catalog_history", "raw_stats", "raw_list_shards",
-                            "logs_read", "logs_follow", "auth_login", "connector_schema", "discover"}
+                            "logs_read", "logs_follow", "auth_login", "connector_schema", "discover",
+                            "draft_author", "draft_test", "draft_delete"}
     words = {word for verb in t.verbs.values() for word in verb.argv}
     words |= {a.flag for verb in t.verbs.values() for a in verb.args}
-    for banned in ("publish", "delete", "draft", "token", "--token", "preview", "update", "rpc", "--models",
+    for banned in ("publish", "token", "--token", "preview", "update", "rpc", "--models",
                    "--auto-approve", "--dangerous-auto-approve"):
         assert banned not in words
     assert [name for name, verb in t.verbs.items() if "auth" in verb.argv] == ["auth_login"]
@@ -853,7 +1006,11 @@ def test_flowctl_table_only_reads_logs_in_and_discovers_for_now():
 def test_flowctl_discover_is_wired_up_and_saves_nothing():
     t = flowctl.table()
     assert t.verbs["discover"].mode == "handler" and t.verbs["discover"].snapshot is None
-    assert set(flowctl.HANDLERS) == {"discover"}
+    assert set(flowctl.HANDLERS) == {"discover", "draft_author", "draft_test", "draft_delete"}
+    assert all(t.verbs[name].mode == "handler" and t.verbs[name].snapshot is None for name in flowctl.HANDLERS)
+    assert "publish" not in json.dumps([v.argv for v in t.verbs.values()])
+    source = (Path(flowctl.__file__).parent / "drafts.py").read_text()
+    assert '"publish"' not in source
     assert build_argv(t, t.verbs["discover"], {"data_plane": "ops/dp/public/aws-us-east-1-c1"}, "me") == [
         "--profile", "me", "discover", "--source", "flow.yaml", "--flat", "--data-plane", "ops/dp/public/aws-us-east-1-c1"]
     with pytest.raises(BadRequest):
