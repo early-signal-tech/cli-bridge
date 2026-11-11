@@ -59,6 +59,12 @@ elif cmd == "discover":
     if how == "login":
         sys.stderr.write("Error: no valid login here\n"); sys.exit(1)
     if how == "hang":
+        # As flowctl does: discover into a draft of its own, which only a finished run deletes.
+        state = json.load(open(os.environ["FAKE_DRAFTS"])) if os.path.exists(os.environ["FAKE_DRAFTS"]) else {"drafts": {}, "selected": None}
+        state["made"] = state.get("made", 0) + 1
+        state["drafts"]["%016x" % (state["made"] + 0xd150)] = json.dumps({"captures": {name: {}}})
+        state.setdefault("created", {})["%016x" % (state["made"] + 0xd150)] = time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime())
+        json.dump(state, open(os.environ["FAKE_DRAFTS"], "w"))
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)
     print("noise with " + secret)
     if how == "plain":
@@ -77,11 +83,16 @@ elif cmd == "draft":
         state["made"] = state.get("made", 0) + 1
         did = "%016x" % (state["made"] + 0xabc0)
         state["drafts"][did] = None; state["selected"] = did
+        state.setdefault("created", {})[did] = time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime())
         print(json.dumps({"id": did, "created_at": "now"}))
     elif sub == "select":
         did = args[args.index("--id") + 1]
         if did not in state["drafts"]: sys.stderr.write("Error: no such draft\n"); sys.exit(1)
         state["selected"] = did
+    elif sub == "list":
+        for did, spec in state["drafts"].items():
+            created = state.get("created", {}).get(did, "2026-01-01T00:00:00.000000Z")
+            print(json.dumps({"id": did, "created_at": created, "detail": state.get("details", {}).get(did, "Created by flowctl")}))
     elif sub == "delete":
         state["drafts"].pop(state["selected"], None); state["selected"] = None
     elif sub == "author":
@@ -498,6 +509,40 @@ def test_a_failed_discover_explains_with_the_secret_taken_out(client):
 
 def test_discover_keeps_the_tools_error_codes(client):
     assert client.result(id="d", type="find", input=find_input("login"))["code"] == "not_logged_in"
+
+
+def test_a_stopped_discover_deletes_the_draft_flowctl_left(env, client):
+    """A real case: stopping discover left flowctl's working draft on Estuary."""
+    path = env["tool"].parent / "drafts.json"
+    path.write_text(json.dumps({"drafts": {"0000000000000001": json.dumps({"captures": {"other/x": {}}}),
+                                           "0000000000000002": json.dumps({"captures": {"acme/pg": {}}})},
+                                "created": {"0000000000000001": "2099-01-01T00:00:00.000000Z", "0000000000000002": "2020-01-01T00:00:00.000000Z"},
+                                "selected": None}))
+    client.send(id="d", type="find", input=find_input("hang"))
+    client.until("d", "accepted")
+    deadline = time.time() + 5
+    while len(drafts(env)) < 3 and time.time() < deadline:
+        time.sleep(0.02)
+    client.send(id="s", type="stop", request="d")
+    assert client.until("d", "result")["result"]["stopped"]
+    # Its own is gone. Another capture's, and an old one of this capture's, are kept.
+    assert sorted(drafts(env)) == ["0000000000000001", "0000000000000002"]
+
+
+@pytest.mark.parametrize("row,names,kept", [
+    ({"detail": "Created by flowctl", "created_at": "2026-11-11T03:05:37.1Z"}, ["acme/pg"], False),
+    ({"detail": "Created by flowctl", "created_at": "2026-11-11T03:05:37.1Z"}, [], False),
+    ({"detail": "Created by flowctl", "created_at": "2026-11-11T03:05:37.1Z"}, ["acme/other"], True),
+    ({"detail": "Created by flowctl", "created_at": "2026-11-11T03:05:37.1Z"}, None, True),
+    ({"detail": "acme/s3/materialize", "created_at": "2026-11-11T03:05:37.1Z"}, ["acme/pg"], True),
+    ({"detail": "Created by flowctl", "created_at": "2026-11-11T02:00:00.0Z"}, ["acme/pg"], True),
+    ({"detail": "Created by flowctl"}, ["acme/pg"], True),
+])
+def test_only_this_discovers_own_drafts_are_leftovers(row, names, kept):
+    from datetime import datetime, timezone
+    listed = json.dumps({"id": "abc", **row})
+    found = flowctl_discover.leftover_drafts(listed, lambda _id: names, "acme/pg", datetime(2026, 11, 11, 3, 5, tzinfo=timezone.utc))
+    assert (found == []) is kept
 
 
 def test_stop_ends_a_discover_and_deletes_its_folder(env, client):
