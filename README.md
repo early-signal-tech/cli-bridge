@@ -163,3 +163,7 @@ uv run es1-serve
 
 `ES1_FLOWCTL` points the engine at a specific flowctl. Otherwise it looks on the path, then
 in `/usr/local/bin`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
