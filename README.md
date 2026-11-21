@@ -6,6 +6,7 @@ background and talks to it over JSON Lines on stdin/stdout. It has no UI of its 
 | Device | Tool | Start command | Table |
 |---|---|---|---|
 | ES-1 | flowctl (Estuary) | `es1-serve` | [`cli_bridge/tools/flowctl/table.json`](cli_bridge/tools/flowctl/table.json) |
+| PB-1 | [parkbench](https://github.com/early-signal-tech/parkbench) (DuckLake benchmark) | `pb1-serve` | [`cli_bridge/tools/parkbench/table.json`](cli_bridge/tools/parkbench/table.json) |
 
 ## Layout
 
@@ -154,11 +155,39 @@ quote a value in that first line. `_meta.uuid` is kept so a follow and a `logs_r
 same time can be de-duplicated. `logs_read` catches up on what happened while nothing was
 following.
 
+## Parkbench (PB-1)
+
+`pb1-serve` runs Parkbench's `setup`, `reset`, `run`, and `secrets list` / `create` / `drop`.
+
+- **`run`** is a stream: it runs `parkbench run --output jsonl`, and each line is an event
+  (`batch`, `tick`, `drift`, `flush`, then `done`). `stop` interrupts it like Ctrl-C, and
+  Parkbench still writes `done` with reason `interrupted`. Its snapshot keeps only the events'
+  numbers and names, not a drift's error text.
+- **Arguments** are PB-1's controls, each typed: the catalog (`metadata_store`, or a
+  `ducklake_secret` by name), the sink, the schema, the rates and sizes. A connection string,
+  a data path or S3 keys can't be passed. Switches are one word (`--migrate=true`), so a value
+  can't become an argument.
+- **Its own folder.** Parkbench keeps a local catalog's files where it runs (`./ducklake_data`),
+  and a local `reset` deletes them there. So the engine runs it in
+  `~/Library/Application Support/Duck Harness/Data/pb1` (`PB1_DATA_DIR` overrides it), never
+  in a checkout.
+- **`reset`** passes `--force`: Parkbench's own prompt can't be answered with stdin closed,
+  and the host asks the person before the request reaches the engine.
+- **`secrets_create`** sends the values in `input` (`{"values": {...}}`) to
+  `parkbench secrets create --type T --name N` on its stdin, so they never become an argument.
+  Nothing is saved. If Parkbench's message quotes a password, secret or key, the result says
+  only that it was withheld.
+- Parkbench doesn't report a version yet, so `hello` says it's untested.
+
+`PB1_PARKBENCH` points the engine at a specific parkbench. Otherwise it looks on the path,
+then in `/usr/local/bin`.
+
 ## Development
 
 ```
 uv run pytest
 uv run es1-serve
+uv run pb1-serve
 ```
 
 `ES1_FLOWCTL` points the engine at a specific flowctl. Otherwise it looks on the path, then

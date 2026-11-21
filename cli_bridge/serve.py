@@ -51,6 +51,10 @@ def tool_report(table: Table) -> dict:
     report["version"] = found
     if found in table.tested_versions:
         report["status"] = "tested"
+    elif not table.tested_versions:
+        report["status"] = "untested"
+        report["warning"] = (f"No {table.tool} version has been marked as tested with this engine yet"
+                             f"{f' (found {found})' if found else ''}.")
     else:
         report["status"] = "untested"
         tested = ", ".join(table.tested_versions)
