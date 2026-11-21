@@ -9,6 +9,8 @@ dependencies = []
 [project.scripts]
 # ES-1's engine: flowctl over the app protocol (JSON Lines on stdin/stdout).
 es1-serve = "cli_bridge.tools.flowctl:main"
+# PB-1's engine: Parkbench, the DuckLake benchmark.
+pb1-serve = "cli_bridge.tools.parkbench:main"
 
 [build-system]
 requires = ["hatchling"]

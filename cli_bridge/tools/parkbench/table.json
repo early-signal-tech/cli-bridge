@@ -1,0 +1,94 @@
+{
+  "device": "pb1",
+  "tool": "parkbench",
+  "binary": "parkbench",
+  "binary_env": "PB1_PARKBENCH",
+  "fallback_paths": ["/usr/local/bin/parkbench"],
+  "version_argv": ["--version"],
+  "version_pattern": "(\\d+\\.\\d+\\.\\d+)",
+  "tested_versions": [],
+  "max_rows": 1000,
+  "error_codes": [
+    {"contains": "connection refused", "code": "unreachable"},
+    {"contains": "Connection refused", "code": "unreachable"},
+    {"contains": "does not exist", "code": "not_found"},
+    {"contains": "Secret with name", "code": "no_secret"}
+  ],
+  "types": {
+    "bool": "true|false",
+    "count": "[0-9]{1,9}",
+    "rate": "0(\\.[0-9]{1,4})?|1(\\.0{1,4})?",
+    "seconds": "[0-9]{1,9}(\\.[0-9]{1,3})?",
+    "secret_name": "[A-Za-z_][A-Za-z0-9_]{0,62}",
+    "secret_type": "ducklake|postgres|s3",
+    "metadata_store": "duckdb|postgres",
+    "data_sink": "ducklake|postgres",
+    "run_mode": "batch|ticker",
+    "schema_mode": "simple|rich|rich_ml",
+    "payload_type": "json|variant",
+    "distribution": "uniform|hotspot|yesterday|last_week",
+    "partition": "[a-z_]+(\\(([0-9]{1,4}, ?)?[a-z_]+\\))?(, ?[a-z_]+(\\(([0-9]{1,4}, ?)?[a-z_]+\\))?){0,3}"
+  },
+  "verbs": {
+    "setup": {
+      "argv": ["setup"], "mode": "once", "snapshot": false, "timeout": 300,
+      "args": {
+        "metadata_store": {"type": "metadata_store", "flag": "--metadata-store"},
+        "ducklake_secret": {"type": "secret_name", "flag": "--ducklake-secret"},
+        "data_sink": {"type": "data_sink", "flag": "--data-sink"},
+        "migrate": {"type": "bool", "format": "--migrate={}"}
+      }
+    },
+    "reset": {
+      "argv": ["reset", "--force"], "mode": "once", "snapshot": false, "timeout": 300,
+      "args": {
+        "metadata_store": {"type": "metadata_store", "flag": "--metadata-store"},
+        "ducklake_secret": {"type": "secret_name", "flag": "--ducklake-secret"},
+        "migrate": {"type": "bool", "format": "--migrate={}"}
+      }
+    },
+    "run": {
+      "argv": ["run", "--output", "jsonl"], "mode": "stream",
+      "snapshot": {"keep": ["event", "batch", "num_batches", "tick", "rows", "batch_secs", "rows_total", "elapsed_secs", "rows_per_sec", "table_rows", "duplicate", "drift", "duplicates", "drifts", "secs", "reason", "steps"]},
+      "args": {
+        "metadata_store": {"type": "metadata_store", "flag": "--metadata-store"},
+        "ducklake_secret": {"type": "secret_name", "flag": "--ducklake-secret"},
+        "data_sink": {"type": "data_sink", "flag": "--data-sink"},
+        "migrate": {"type": "bool", "format": "--migrate={}"},
+        "run_mode": {"type": "run_mode", "flag": "--run-mode", "required": true},
+        "mode": {"type": "schema_mode", "flag": "--mode"},
+        "payload_type": {"type": "payload_type", "flag": "--payload-type"},
+        "num_users": {"type": "count", "flag": "--num-users"},
+        "ml_labels": {"type": "bool", "format": "--ml-labels={}"},
+        "conversion_rate": {"type": "rate", "flag": "--conversion-rate"},
+        "flush_interval": {"type": "count", "flag": "--flush-interval"},
+        "batch_size": {"type": "count", "flag": "--batch-size"},
+        "batch_size_min": {"type": "count", "flag": "--batch-size-min"},
+        "batch_size_max": {"type": "count", "flag": "--batch-size-max"},
+        "num_batches": {"type": "count", "flag": "--num-batches"},
+        "distribution": {"type": "distribution", "flag": "--distribution"},
+        "hotspot_days": {"type": "count", "flag": "--hotspot-days"},
+        "partition_by": {"type": "partition", "flag": "--partition-by"},
+        "tick_interval": {"type": "seconds", "flag": "--tick-interval"},
+        "duration": {"type": "count", "flag": "--duration"},
+        "duplicate_rate": {"type": "rate", "flag": "--duplicate-rate"},
+        "schema_drift_rate": {"type": "rate", "flag": "--schema-drift-rate"}
+      }
+    },
+    "secrets_list": {
+      "argv": ["secrets", "list", "--output", "jsonl"], "mode": "once", "timeout": 60,
+      "snapshot": {"keep": ["name", "type", "provider", "persistent", "storage", "scope"]}
+    },
+    "secrets_create": {
+      "argv": ["secrets", "create"], "mode": "handler", "snapshot": false, "timeout": 60,
+      "args": {
+        "type": {"type": "secret_type", "flag": "--type", "required": true},
+        "name": {"type": "secret_name", "flag": "--name", "required": true}
+      }
+    },
+    "secrets_drop": {
+      "argv": ["secrets", "drop"], "mode": "once", "snapshot": false, "timeout": 60,
+      "args": {"name": {"type": "secret_name", "required": true}}
+    }
+  }
+}
