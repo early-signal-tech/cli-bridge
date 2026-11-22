@@ -1274,3 +1274,30 @@ def test_tool_report_handles_a_tool_that_wont_say_its_version(env, monkeypatch):
     env["tool"].write_text("#!/bin/sh\nexit 1\n")
     report = tool_report(env["table"])
     assert report["status"] == "untested" and report["version"] is None and "unknown version" in report["warning"]
+
+
+def test_stop_kills_a_command_that_ignores_it_once_its_grace_runs_out(tmp_path):
+    import subprocess
+    from cli_bridge.run import Job
+    job = Job(kill_after=0.3)
+    proc = job.spawn(["python3", "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('up', flush=True); time.sleep(30)"],
+                     subprocess.PIPE, subprocess.DEVNULL)
+    proc.stdout.readline()
+    started = time.monotonic()
+    job.stop()
+    proc.wait(10)
+    assert time.monotonic() - started < 5
+    assert proc.returncode == -9
+
+
+def test_a_tables_stop_grace_is_checked(tmp_path):
+    table = json.loads(json.dumps(TABLE))
+    first = next(iter(table["verbs"]))
+    table["verbs"][first]["stop_grace"] = 0
+    path = tmp_path / "t.json"
+    path.write_text(json.dumps(table))
+    with pytest.raises(ValueError, match="stop_grace"):
+        load_table(path)
+    table["verbs"][first]["stop_grace"] = 30
+    path.write_text(json.dumps(table))
+    assert load_table(path).verbs[first].stop_grace == 30

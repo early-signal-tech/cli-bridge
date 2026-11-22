@@ -204,7 +204,10 @@ def save_raw_snapshot(tmp_path: str, root: Path, device: str, verb: str) -> str:
 class Job:
     """One running command. stop() can arrive from another thread at any point, even before it starts."""
 
-    def __init__(self):
+    def __init__(self, kill_after: float = KILL_AFTER_SECONDS):
+        # How long stop() waits after SIGTERM before SIGKILL: a tool that finishes up when
+        # interrupted (Parkbench flushes to Parquet) needs longer than one that just exits.
+        self.kill_after = kill_after
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
         self.stopped = False
@@ -232,7 +235,7 @@ class Job:
 
         def escalate():
             try:
-                proc.wait(KILL_AFTER_SECONDS)
+                proc.wait(self.kill_after)
             except subprocess.TimeoutExpired:
                 self._signal(proc, signal.SIGKILL)
 

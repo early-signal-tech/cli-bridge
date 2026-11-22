@@ -48,7 +48,7 @@
       }
     },
     "run": {
-      "argv": ["run", "--output", "jsonl"], "mode": "stream",
+      "argv": ["run", "--output", "jsonl"], "mode": "stream", "stop_grace": 120,
       "snapshot": {"keep": ["event", "batch", "num_batches", "tick", "rows", "batch_secs", "rows_total", "elapsed_secs", "rows_per_sec", "table_rows", "duplicate", "drift", "duplicates", "drifts", "secs", "reason", "steps"]},
       "args": {
         "metadata_store": {"type": "metadata_store", "flag": "--metadata-store"},
