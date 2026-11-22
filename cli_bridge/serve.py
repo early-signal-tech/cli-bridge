@@ -62,12 +62,20 @@ def tool_report(table: Table) -> dict:
     return report
 
 
+# Runs before a request's command, on its own thread, with the verb and the request. It can get
+# something the command needs ready (PB-1 starts its Quack server), and raises BadRequest if it
+# can't, which ends the request with that error and code.
+Prepare = Callable[[Any, dict], None]
+
+
 class Server:
     def __init__(self, table: Table, stdin, stdout, snapshot_root: Path | None = None,
-                 handlers: dict[str, Handler] | None = None, work_root: Path | None = None):
+                 handlers: dict[str, Handler] | None = None, work_root: Path | None = None,
+                 prepare: Prepare | None = None):
         self.table, self.stdin, self.stdout = table, stdin, stdout
         self.snapshot_root = snapshot_root or default_snapshot_root()
         self.handlers = handlers or {}
+        self.prepare = prepare
         self.work_root = work_root or default_work_root()
         self._write_lock = threading.Lock()
         self._jobs: dict[str, tuple[Job, threading.Thread]] = {}
@@ -150,7 +158,7 @@ class Server:
                     raise BadRequest(f"{kind} isn't available in this engine")
                 checked = self.handlers[kind].check(request.get("input"))
         except BadRequest as e:
-            self.error(rid, str(e))
+            self.error(rid, str(e), e.code)
             return
         binary = self.table.find_binary()
         if not binary:
@@ -162,13 +170,15 @@ class Server:
                 self.error(rid, f"request {rid} is already running")
                 return
             job = Job()
-            thread = threading.Thread(target=self._run, args=(rid, verb, binary, argv, job, checked), daemon=True)
+            thread = threading.Thread(target=self._run, args=(rid, verb, binary, argv, job, checked, request), daemon=True)
             self._jobs[rid] = (job, thread)
         self.send({"id": rid, "type": "accepted"})
         thread.start()
 
-    def _run(self, rid, verb, binary, argv, job, checked=None) -> None:
+    def _run(self, rid, verb, binary, argv, job, checked=None, request=None) -> None:
         try:
+            if self.prepare:
+                self.prepare(verb, request or {})
             if verb.mode == "handler":
                 result = self._run_handler(verb, binary, argv, job, checked)
             elif verb.mode == "login":
@@ -179,6 +189,8 @@ class Server:
                 result = run_stream(self.table, verb, binary, argv, job, on_line, self.snapshot_root)
             else:
                 result = run_once(self.table, verb, binary, argv, job, self.snapshot_root)
+        except BadRequest as e:
+            result = {"ok": False, "error": str(e), "code": e.code, "exit": None}
         except OSError as e:
             result = {"ok": False, "error": f"couldn't run {self.table.tool}: {e}", "code": "tool_error", "exit": None}
         with self._jobs_lock:
@@ -215,5 +227,5 @@ class Server:
         self.stop_all()  # end of input
 
 
-def serve_table(table: Table, handlers: dict[str, Handler] | None = None) -> None:
-    Server(table, sys.stdin, sys.stdout, handlers=handlers).serve()
+def serve_table(table: Table, handlers: dict[str, Handler] | None = None, prepare: Prepare | None = None) -> None:
+    Server(table, sys.stdin, sys.stdout, handlers=handlers, prepare=prepare).serve()
