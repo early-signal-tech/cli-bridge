@@ -12,6 +12,7 @@ import pytest
 from cli_bridge.serve import Server, tool_report
 from cli_bridge.table import BadRequest, build_argv
 from cli_bridge.tools import parkbench
+from cli_bridge.tools.parkbench.quack import QuackServer
 
 PASSWORD = "pw-7f3k-not-real-qz9"
 
@@ -19,7 +20,15 @@ FAKE_PARKBENCH = r"""#!/usr/bin/env python3
 import json, os, signal, sys, time
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALLS"], "a") as f:
-    f.write(json.dumps({"args": args, "cwd": os.getcwd()}) + "\n")
+    f.write(json.dumps({"args": args, "cwd": os.getcwd(), "token": os.environ.get("PARKBENCH_QUACK_TOKEN")}) + "\n")
+if args[:1] == ["quack-serve"]:
+    if os.environ.get("FAKE_QUACK_FAIL"):
+        print("Error: start quack server: address in use", file=sys.stderr)
+        sys.exit(1)
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    print(json.dumps({"event": "serving", "uri": args[args.index("--quack-uri") + 1]}), flush=True)
+    while True:
+        time.sleep(0.05)
 if args[:1] == ["--version"]:
     print("Error: unknown flag: --version", file=sys.stderr)
     sys.exit(1)
@@ -64,7 +73,7 @@ sys.exit(1)
 
 
 class Client:
-    def __init__(self, server_kwargs):
+    def __init__(self, server_kwargs, quack_folder):
         r, w = os.pipe()
         self.requests = os.fdopen(w, "w")
         self.messages: queue.Queue = queue.Queue()
@@ -76,7 +85,9 @@ class Client:
                     client.messages.put(json.loads(line))
                 return len(text)
 
-        self.server = Server(parkbench.table(), os.fdopen(r, "r"), Out(), handlers=parkbench.HANDLERS, **server_kwargs)
+        self.quack = QuackServer(quack_folder, parkbench.table().find_binary, port=19495, token="tok-test-123")
+        self.server = Server(parkbench.table(), os.fdopen(r, "r"), Out(), handlers=parkbench.handlers(self.quack),
+                             prepare=self.quack.prepare, **server_kwargs)
         self.thread = threading.Thread(target=self.server.serve, daemon=True)
         self.thread.start()
 
@@ -102,6 +113,7 @@ class Client:
     def close(self):
         self.requests.close()
         self.thread.join(10)
+        self.quack.stop()
 
 
 @pytest.fixture
@@ -117,7 +129,8 @@ def env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(env):
-    c = Client({"snapshot_root": env / "Snapshots", "work_root": env / "Work"})
+    (env / "data").mkdir()
+    c = Client({"snapshot_root": env / "Snapshots", "work_root": env / "Work"}, env / "data")
     yield c
     c.close()
 
@@ -136,7 +149,7 @@ def argv(verb, args=None):
 
 
 def test_the_table_loads_with_every_verb():
-    assert set(parkbench.table().verbs) == {"setup", "reset", "run", "secrets_list", "secrets_create", "secrets_drop"}
+    assert set(parkbench.table().verbs) == {"setup", "reset", "run", "secrets_list", "secrets_create", "secrets_drop", "quack_start"}
 
 
 def test_run_asks_for_json_lines_and_maps_pb1s_flags():
@@ -214,7 +227,7 @@ def test_parkbench_runs_in_the_engines_own_folder(env, monkeypatch):
     data = env / "Data" / "pb1"
     monkeypatch.setenv("PB1_DATA_DIR", str(data))
     started = os.getcwd()
-    monkeypatch.setattr(parkbench, "serve_table", lambda table, handlers: None)
+    monkeypatch.setattr(parkbench, "serve_table", lambda table, handlers, prepare: None)
     try:
         parkbench.main()
         assert os.getcwd() == str(data.resolve())
@@ -277,3 +290,73 @@ def test_a_failed_create_keeps_a_message_that_quotes_no_credential(env, client):
 def test_drop_takes_the_name_as_its_one_argument(env, client):
     assert client.result(id="d", type="secrets_drop", args={"name": "ducklake_stage"})["ok"] is True
     assert calls(env)[-1]["args"] == ["secrets", "drop", "ducklake_stage"]
+
+
+# the Quack server
+
+
+def quack_serves(env):
+    return [c for c in calls(env) if c["args"][:1] == ["quack-serve"]]
+
+
+def test_quack_start_serves_the_catalog_once_and_writes_a_private_init_file(env, client):
+    first = client.result(id="q1", type="quack_start")
+    assert first["ok"] is True and first["uri"] == "quack:localhost:19495"
+    init = env / "data" / "query.sql"
+    assert first["init"] == str(init)
+    assert oct(init.stat().st_mode & 0o777) == "0o600"
+    text = init.read_text()
+    assert "TOKEN 'tok-test-123'" in text and "ATTACH 'ducklake:quack:localhost:19495' AS wh (DATA_PATH './ducklake_data/')" in text
+    assert client.result(id="q2", type="quack_start")["ok"] is True
+    serves = quack_serves(env)
+    assert len(serves) == 1  # already running: not started again
+    assert serves[0]["args"] == ["quack-serve", "--quack-uri", "quack:localhost:19495"]
+    assert serves[0]["token"] == "tok-test-123" and "tok-test-123" not in json.dumps(serves[0]["args"])
+
+
+def test_a_run_on_the_quack_catalog_starts_the_server_first_and_others_dont(env, client, monkeypatch):
+    client.quack.environment()
+    assert client.result(id="s", type="setup", args={"metadata_store": "duckdb"})["ok"] is True
+    assert quack_serves(env) == []
+    client.send(id="r", type="run", args={"run_mode": "batch", "metadata_store": "quack", "num_batches": "3"})
+    result, _ = client.until("r", "result")
+    assert result["result"]["ok"] is True
+    order = [c["args"][0] for c in calls(env)]
+    assert order[-2:] == ["quack-serve", "run"]
+    assert calls(env)[-1]["token"] == "tok-test-123"  # the run attaches with the server's token
+
+
+def test_stopping_the_server_deletes_the_token_files(env, client):
+    client.result(id="q", type="quack_start")
+    pid = int((env / "data" / "quack.pid").read_text())
+    client.quack.stop()
+    assert not (env / "data" / "query.sql").exists() and not (env / "data" / "quack.pid").exists()
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_a_server_left_by_a_crashed_engine_is_stopped_first(env, client):
+    client.result(id="q", type="quack_start")
+    left = int((env / "data" / "quack.pid").read_text())
+    client.quack._proc = None  # as if a new engine started, with the old server still up
+    client.result(id="q2", type="quack_start")
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(left, 0)
+    assert int((env / "data" / "quack.pid").read_text()) != left
+
+
+def test_a_server_that_cant_start_says_so_with_its_own_code(env, client, monkeypatch):
+    monkeypatch.setenv("FAKE_QUACK_FAIL", "1")
+    result = client.result(id="q", type="quack_start")
+    assert result["ok"] is False and result["code"] == "quack_unavailable" and "port 19495" in result["error"]
+    run = client.result(id="r", type="setup", args={"metadata_store": "quack"})
+    assert run["code"] == "quack_unavailable"
+    assert [c for c in calls(env) if c["args"][:1] == ["setup"]] == []  # setup itself never ran
+
+
+def test_quack_start_takes_no_input(env, client):
+    client.send(id="q", type="quack_start", input={"x": 1})
+    error, _ = client.until("q", "error")
+    assert "no input" in error["error"]

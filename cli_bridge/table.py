@@ -16,7 +16,9 @@ OUTPUTS = ("lines", "document")
 
 
 class BadRequest(Exception):
-    """A request the table doesn't allow. Nothing has been run."""
+    """A request the table doesn't allow. Nothing has been run. A subclass can set its own `code`."""
+
+    code = "bad_request"
 
 
 @dataclass(frozen=True)

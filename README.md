@@ -177,6 +177,16 @@ following.
   `parkbench secrets create --type T --name N` on its stdin, so they never become an argument.
   Nothing is saved. If Parkbench's message quotes a password, secret or key, the result says
   only that it was withheld.
+- **The local DuckDB catalog goes through a Quack server**, so runs and a DuckDB terminal
+  (PB-1's QUERY) can use it at once. DuckDB lets one process open the `.ducklake` file for
+  writing, so the engine runs `parkbench quack-serve` to own it, on `quack:localhost:9495`
+  (Parkbench's default), and requests with `metadata_store: "quack"` attach through it. It
+  starts the first time something needs it: one of those requests, or `quack_start`, which
+  returns the init file a terminal opens with (`duckdb -init query.sql`, in the engine's
+  folder). It stops when the engine does. The token is new for each engine and reaches
+  Parkbench only as `PARKBENCH_QUACK_TOKEN`. The init file holds it too, so it's readable only
+  by you and deleted when the server stops. A server a crashed engine left behind is stopped
+  first. If it can't start (say, the port is taken), the request ends with `quack_unavailable`.
 - Parkbench doesn't report a version yet, so `hello` says it's untested.
 
 `PB1_PARKBENCH` points the engine at a specific parkbench. Otherwise it looks on the path,

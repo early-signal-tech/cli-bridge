@@ -21,7 +21,7 @@
     "seconds": "[0-9]{1,9}(\\.[0-9]{1,3})?",
     "secret_name": "[A-Za-z_][A-Za-z0-9_]{0,62}",
     "secret_type": "ducklake|postgres|s3",
-    "metadata_store": "duckdb|postgres",
+    "metadata_store": "duckdb|postgres|quack",
     "data_sink": "ducklake|postgres",
     "run_mode": "batch|ticker",
     "schema_mode": "simple|rich|rich_ml",
@@ -74,6 +74,9 @@
         "duplicate_rate": {"type": "rate", "flag": "--duplicate-rate"},
         "schema_drift_rate": {"type": "rate", "flag": "--schema-drift-rate"}
       }
+    },
+    "quack_start": {
+      "argv": ["quack-serve"], "mode": "handler", "snapshot": false, "timeout": 90
     },
     "secrets_list": {
       "argv": ["secrets", "list", "--output", "jsonl"], "mode": "once", "timeout": 60,
