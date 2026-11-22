@@ -161,7 +161,9 @@ following.
 
 - **`run`** is a stream: it runs `parkbench run --output jsonl`, and each line is an event
   (`batch`, `tick`, `drift`, `flush`, then `done`). `stop` interrupts it like Ctrl-C, and
-  Parkbench still writes `done` with reason `interrupted`. Its snapshot keeps only the events'
+  Parkbench still writes `done` with reason `interrupted`. Parkbench flushes to Parquet when it's
+  interrupted, which on a remote catalog (S3) can take a while, so `run` gets 120 seconds after
+  the stop before it's killed (`"stop_grace"` in its table entry; the default is 5). Its snapshot keeps only the events'
   numbers and names, not a drift's error text.
 - **Arguments** are PB-1's controls, each typed: the catalog (`metadata_store`, or a
   `ducklake_secret` by name), the sink, the schema, the rates and sizes. A connection string,

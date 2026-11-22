@@ -11,6 +11,8 @@ MAX_VALUE_LENGTH = 512
 MAX_VALUES = 100
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_ROWS = 20_000
+DEFAULT_STOP_GRACE_SECONDS = 5.0  # after stop's SIGTERM, before SIGKILL
+MAX_STOP_GRACE_SECONDS = 600.0
 MODES = ("once", "stream", "login", "handler")
 OUTPUTS = ("lines", "document")
 
@@ -54,6 +56,7 @@ class Verb:
     snapshot: SnapshotRule | None  # None: never saved
     timeout: float
     output: str = "lines"  # or "document": stdout is one JSON value, and a list's items are the rows
+    stop_grace: float = DEFAULT_STOP_GRACE_SECONDS  # how long a stopped command gets to finish up
 
     def describe(self) -> dict:
         """What hello tells the face about this verb."""
@@ -147,8 +150,11 @@ def load_table(path: str | Path) -> Table:
         output = spec.get("output", "lines")
         if output not in OUTPUTS:
             raise ValueError(f"verb {name}: unknown output {output!r}")
+        grace = float(spec.get("stop_grace", DEFAULT_STOP_GRACE_SECONDS))
+        if not 0 < grace <= MAX_STOP_GRACE_SECONDS:
+            raise ValueError(f"verb {name}: stop_grace must be more than 0 and at most {MAX_STOP_GRACE_SECONDS:g} seconds")
         verbs[name] = Verb(name, tuple(spec["argv"]), spec["mode"], tuple(args), _load_snapshot_rule(name, spec),
-                           float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS)), output)
+                           float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS)), output, grace)
     profile_type = raw.get("profile_type")
     noise = raw.get("stderr_noise")
     return Table(

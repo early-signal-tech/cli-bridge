@@ -64,6 +64,9 @@ if args[:1] == ["run"]:
         print(json.dumps({"event": "batch", "batch": n, "num_batches": 3, "rows": 10, "batch_secs": 0.01,
                           "rows_total": n * 10, "elapsed_secs": n, "rows_per_sec": 10.0, "table_rows": n * 10}), flush=True)
         time.sleep(0.05)
+    if stopped:  # Parkbench flushes to Parquet when interrupted; a remote catalog can take a while.
+        time.sleep(float(os.environ.get("FAKE_FLUSH_SECS", "0")))
+        print(json.dumps({"event": "flush", "rows": n * 10, "secs": 0.1}), flush=True)
     print(json.dumps({"event": "done", "reason": "interrupted" if stopped else "complete", "steps": n,
                       "rows_total": n * 10, "elapsed_secs": n, "rows_per_sec": 10.0, "duplicates": 0, "drifts": 0}), flush=True)
     sys.exit(0)
@@ -360,3 +363,16 @@ def test_quack_start_takes_no_input(env, client):
     client.send(id="q", type="quack_start", input={"x": 1})
     error, _ = client.until("q", "error")
     assert "no input" in error["error"]
+
+
+def test_a_stopped_run_gets_time_to_finish_its_flush(env, client, monkeypatch):
+    # Longer than the 5 seconds a stopped command used to get before SIGKILL.
+    monkeypatch.setenv("FAKE_FLUSH_SECS", "6")
+    assert parkbench.table().verbs["run"].stop_grace == 120
+    client.send(id="r", type="run", args={"run_mode": "batch", "num_batches": "0"})
+    client.until("r", "event")
+    client.send(id="s", type="stop", request="r")
+    result, seen = client.until("r", "result", timeout=20)
+    events = [m["line"]["event"] for m in seen if m["type"] == "event"]
+    assert events[-2:] == ["flush", "done"]
+    assert result["result"]["stopped"] is True

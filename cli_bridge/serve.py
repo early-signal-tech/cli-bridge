@@ -169,7 +169,7 @@ class Server:
             if rid in self._jobs:
                 self.error(rid, f"request {rid} is already running")
                 return
-            job = Job()
+            job = Job(kill_after=verb.stop_grace)
             thread = threading.Thread(target=self._run, args=(rid, verb, binary, argv, job, checked, request), daemon=True)
             self._jobs[rid] = (job, thread)
         self.send({"id": rid, "type": "accepted"})
